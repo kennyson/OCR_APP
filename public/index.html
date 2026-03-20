@@ -1,0 +1,111 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Box PDF OCR – Setup Guide</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #f5f5f5; color: #333; }
+    header { background: #0061d5; color: #fff; padding: 20px 32px; }
+    header h1 { font-size: 22px; font-weight: 700; }
+    header p { font-size: 14px; opacity: 0.85; margin-top: 4px; }
+    main { max-width: 820px; margin: 40px auto; padding: 0 24px 64px; }
+    .status { background: #e8f5e9; border: 1px solid #a5d6a7; border-radius: 8px; padding: 16px 20px; margin-bottom: 32px; font-size: 14px; color: #2e7d32; }
+    .status strong { display: block; margin-bottom: 4px; font-size: 15px; }
+    h2 { font-size: 18px; margin-bottom: 16px; color: #111; }
+    .steps { list-style: none; counter-reset: steps; }
+    .steps li { counter-increment: steps; display: flex; gap: 16px; margin-bottom: 20px; }
+    .steps li::before { content: counter(steps); background: #0061d5; color: #fff; border-radius: 50%; width: 28px; height: 28px; min-width: 28px; display: flex; align-items: center; justify-content: center; font-size: 13px; font-weight: 700; margin-top: 1px; }
+    .steps li > div { flex: 1; }
+    .steps li strong { display: block; font-size: 15px; margin-bottom: 4px; }
+    .steps li p { font-size: 14px; color: #555; line-height: 1.5; }
+    code { background: #eee; border-radius: 4px; padding: 2px 6px; font-size: 13px; font-family: 'Courier New', monospace; word-break: break-all; }
+    .url-box { background: #fff; border: 1px solid #ddd; border-radius: 6px; padding: 12px 16px; margin-top: 8px; font-family: 'Courier New', monospace; font-size: 13px; word-break: break-all; color: #0061d5; }
+    .section { background: #fff; border-radius: 8px; box-shadow: 0 1px 4px rgba(0,0,0,0.08); padding: 28px 28px; margin-bottom: 24px; }
+    .note { background: #fff8e1; border-left: 4px solid #ffc107; padding: 12px 16px; border-radius: 0 6px 6px 0; font-size: 13px; color: #555; margin-top: 16px; line-height: 1.5; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Box PDF OCR</h1>
+    <p>Extract text from any PDF stored in Box — powered by Box AI</p>
+  </header>
+  <main>
+    <div class="status">
+      <strong>Server is running</strong>
+      Follow the steps below to connect this server to your Box account as a Web App Integration.
+    </div>
+
+    <div class="section">
+      <h2>How it works</h2>
+      <p style="font-size:14px;color:#555;line-height:1.6;">
+        Once configured, right-clicking any PDF in Box.com will show an <strong>"OCR Document"</strong> option.
+        Clicking it opens this app, which uses Box AI to extract all text from the PDF and displays it in your browser.
+        No files are stored — everything happens in real time.
+      </p>
+    </div>
+
+    <div class="section">
+      <h2>Setup: Register as a Box Web App Integration</h2>
+      <ol class="steps">
+        <li>
+          <div>
+            <strong>Create a Box Custom App</strong>
+            <p>Go to the <a href="https://app.box.com/developers/console" target="_blank">Box Developer Console</a>, click <strong>Create New App</strong>, choose <strong>Custom App</strong>, then select <strong>User Authentication (OAuth 2.0)</strong>.</p>
+          </div>
+        </li>
+        <li>
+          <div>
+            <strong>Set required scopes</strong>
+            <p>Under <strong>Configuration → Scopes</strong>, enable:<br>
+            &bull; <em>Read all files and folders stored in Box</em><br>
+            &bull; <em>Use AI features</em></p>
+          </div>
+        </li>
+        <li>
+          <div>
+            <strong>Add a Web App Integration</strong>
+            <p>Go to <strong>Configuration → Web App Integrations</strong> and click <strong>Create a Web App Integration</strong>.</p>
+          </div>
+        </li>
+        <li>
+          <div>
+            <strong>Configure the integration</strong>
+            <p>Fill in the fields:</p>
+            <ul style="margin-top:8px;padding-left:20px;font-size:14px;color:#555;line-height:2;">
+              <li><strong>App Name:</strong> OCR Document</li>
+              <li><strong>Description:</strong> Extract text from this PDF using Box AI</li>
+              <li><strong>File extensions:</strong> <code>pdf</code></li>
+              <li><strong>Execute URL:</strong></li>
+            </ul>
+            <div class="url-box">
+              http://YOUR-DOMAIN/ocr?file_id={file_id}&amp;access_token={access_token}&amp;file_name={file_name}
+            </div>
+            <p style="margin-top:8px;font-size:13px;color:#555;">Replace <code>YOUR-DOMAIN</code> with this server's publicly accessible hostname and port (e.g. from <a href="https://ngrok.com" target="_blank">ngrok</a> for local testing, or your deployed URL).</p>
+          </div>
+        </li>
+        <li>
+          <div>
+            <strong>Save and publish</strong>
+            <p>Save the integration. It will appear in Box under the <strong>Open With</strong> or right-click context menu for PDF files.</p>
+          </div>
+        </li>
+      </ol>
+
+      <div class="note">
+        <strong>Local testing tip:</strong> Run <code>npx ngrok http 3000</code> to expose this server publicly, then use the generated HTTPS URL in the Execute URL above.
+      </div>
+    </div>
+
+    <div class="section">
+      <h2>Requirements</h2>
+      <ul style="font-size:14px;color:#555;line-height:2;padding-left:20px;">
+        <li>Box account with <strong>AI features enabled</strong> (Business Plus or Enterprise plan)</li>
+        <li>Node.js 18+</li>
+        <li>This server accessible via a public HTTPS URL</li>
+      </ul>
+    </div>
+  </main>
+</body>
+</html>

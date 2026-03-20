@@ -1,0 +1,14 @@
+{
+  "name": "code-cola-widget",
+  "version": "1.0.0",
+  "description": "Box Web App Integration for PDF OCR using Box AI",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "axios": "^1.7.2",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2"
+  }
+}
