@@ -29,7 +29,7 @@
 <body>
   <header>
     <h1>Box PDF OCR</h1>
-    <p>Extract text from any PDF stored in Box — powered by Box AI</p>
+    <p>Make any scanned PDF searchable — right from Box.com</p>
   </header>
   <main>
     <div class="status">
@@ -41,9 +41,20 @@
       <h2>How it works</h2>
       <p style="font-size:14px;color:#555;line-height:1.6;">
         Once configured, right-clicking any PDF in Box.com will show an <strong>"OCR Document"</strong> option.
-        Clicking it opens this app, which uses Box AI to extract all text from the PDF and displays it in your browser.
-        No files are stored — everything happens in real time.
+        Clicking it downloads the PDF, runs OCR using <a href="https://ocrmypdf.readthedocs.io" target="_blank">ocrmypdf</a> (powered by Tesseract),
+        and saves the searchable PDF back to Box as a new version — replacing your manual Adobe workflow.
+        Pages that are already searchable are left untouched.
       </p>
+    </div>
+
+    <div class="section">
+      <h2>Server requirements</h2>
+      <p style="font-size:14px;color:#555;margin-bottom:12px;">Install these on the machine running this server before use:</p>
+      <ul style="font-size:14px;color:#555;line-height:2;padding-left:20px;">
+        <li>Node.js 18+</li>
+        <li>Tesseract OCR — <a href="https://tesseract-ocr.github.io/tessdoc/Installation.html" target="_blank">installation guide</a></li>
+        <li>ocrmypdf — <code>pip install ocrmypdf</code></li>
+      </ul>
     </div>
 
     <div class="section">
@@ -59,8 +70,7 @@
           <div>
             <strong>Set required scopes</strong>
             <p>Under <strong>Configuration → Scopes</strong>, enable:<br>
-            &bull; <em>Read all files and folders stored in Box</em><br>
-            &bull; <em>Use AI features</em></p>
+            &bull; <em>Read and write all files and folders stored in Box</em></p>
           </div>
         </li>
         <li>
@@ -75,7 +85,7 @@
             <p>Fill in the fields:</p>
             <ul style="margin-top:8px;padding-left:20px;font-size:14px;color:#555;line-height:2;">
               <li><strong>App Name:</strong> OCR Document</li>
-              <li><strong>Description:</strong> Extract text from this PDF using Box AI</li>
+              <li><strong>Description:</strong> Make this PDF searchable using OCR</li>
               <li><strong>File extensions:</strong> <code>pdf</code></li>
               <li><strong>Execute URL:</strong></li>
             </ul>
@@ -96,15 +106,6 @@
       <div class="note">
         <strong>Local testing tip:</strong> Run <code>npx ngrok http 3000</code> to expose this server publicly, then use the generated HTTPS URL in the Execute URL above.
       </div>
-    </div>
-
-    <div class="section">
-      <h2>Requirements</h2>
-      <ul style="font-size:14px;color:#555;line-height:2;padding-left:20px;">
-        <li>Box account with <strong>AI features enabled</strong> (Business Plus or Enterprise plan)</li>
-        <li>Node.js 18+</li>
-        <li>This server accessible via a public HTTPS URL</li>
-      </ul>
     </div>
   </main>
 </body>
