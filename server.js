@@ -202,12 +202,60 @@ app.get('/api/folder-pdfs', async (req, res) => {
   }
 });
 
+// ── Page-by-page OCR ─────────────────────────────────────────────────────────
+async function ocrByPage(inputPath, outputPath, requestId) {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'box-ocr-pages-'));
+  try {
+    // Get page count
+    const { stdout } = await execFileAsync('qpdf', ['--show-npages', inputPath]);
+    const pageCount = parseInt(stdout.trim(), 10);
+    console.log(`OCR: splitting ${pageCount} pages`);
+
+    const ocrPagePaths = [];
+
+    for (let i = 1; i <= pageCount; i++) {
+      const pageIn  = path.join(tmpDir, `page-${i}-in.pdf`);
+      const pageOut = path.join(tmpDir, `page-${i}-out.pdf`);
+
+      // Extract single page
+      await execFileAsync('qpdf', ['--empty', '--pages', inputPath, String(i), '--', pageIn]);
+
+      // OCR the page
+      const proc = execFile('ocrmypdf', [
+        '--skip-text', '--jobs', '1', '--output-type', 'pdf', '--fast-web-view', '0',
+        pageIn, pageOut
+      ]);
+      if (requestId) activeProcesses.set(requestId, proc);
+
+      await new Promise((resolve, reject) => {
+        proc.on('close', code => {
+          if (requestId) activeProcesses.delete(requestId);
+          if (code === 0 || code === 6) resolve();        // 6 = already had text, ok
+          else if (code === null) reject(Object.assign(new Error('Cancelled'), { killed: true }));
+          else reject(new Error(`Page ${i}: ocrmypdf exited with code ${code}`));
+        });
+        proc.on('error', err => {
+          if (requestId) activeProcesses.delete(requestId);
+          reject(err);
+        });
+      });
+
+      ocrPagePaths.push(pageOut);
+    }
+
+    // Merge all OCR'd pages into final output
+    await execFileAsync('qpdf', ['--empty', '--pages', ...ocrPagePaths, '--', outputPath]);
+  } finally {
+    try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch {}
+  }
+}
+
 // ── API: OCR a single file ───────────────────────────────────────────────────
 app.post('/api/ocr', async (req, res) => {
   const { file_id, file_name, access_token, request_id } = req.body;
   if (!access_token) return res.status(401).json({ error: 'Not authenticated' });
 
-  const inputPath = path.join(os.tmpdir(), `box-ocr-in-${file_id}.pdf`);
+  const inputPath  = path.join(os.tmpdir(), `box-ocr-in-${file_id}.pdf`);
   const outputPath = path.join(os.tmpdir(), `box-ocr-out-${file_id}.pdf`);
 
   try {
@@ -218,44 +266,14 @@ app.post('/api/ocr', async (req, res) => {
     );
     fs.writeFileSync(inputPath, data);
 
-    // OCR (cancellable, memory-efficient, 10-min timeout)
-    const ocrProcess = execFile('ocrmypdf', [
-      '--skip-text',
-      '--rotate-pages',
-      '--jobs', '1',          // single-threaded to limit memory use
-      '--output-type', 'pdf', // skip PDF/A conversion (less memory)
-      '--fast-web-view', '0', // skip linearization
-      inputPath,
-      outputPath
-    ]);
-    if (request_id) activeProcesses.set(request_id, ocrProcess);
+    // OCR page by page
+    await ocrByPage(inputPath, outputPath, request_id);
 
-    // Kill if it runs longer than 10 minutes
-    const timeout = setTimeout(() => {
-      ocrProcess.kill('SIGTERM');
-    }, 10 * 60 * 1000);
-
-    await new Promise((resolve, reject) => {
-      ocrProcess.on('close', (code) => {
-        clearTimeout(timeout);
-        if (request_id) activeProcesses.delete(request_id);
-        if (code === 0) resolve();
-        else if (code === null) reject(Object.assign(new Error('OCR timed out or was cancelled'), { killed: true }));
-        else reject(new Error(`ocrmypdf exited with code ${code}`));
-      });
-      ocrProcess.on('error', (err) => {
-        clearTimeout(timeout);
-        if (request_id) activeProcesses.delete(request_id);
-        reject(err);
-      });
-    });
-
-    // Upload new version
+    // Upload new version to Box
     const form = new FormData();
     form.append('attributes', JSON.stringify({ name: file_name }));
     form.append('file', fs.createReadStream(outputPath), {
-      filename: file_name,
-      contentType: 'application/pdf'
+      filename: file_name, contentType: 'application/pdf'
     });
     await axios.post(
       `https://upload.box.com/api/2.0/files/${file_id}/content`,
