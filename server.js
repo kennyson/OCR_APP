@@ -74,8 +74,23 @@ app.get('/callback', async (req, res) => {
       { headers: { 'Content-Type': 'application/x-www-form-urlencoded' } }
     );
 
-    // Embed the token directly in the page — no server-side session needed
-    res.send(renderApp(stateData.file_id, stateData.file_name, data.access_token));
+    const accessToken = data.access_token;
+    let fileName = stateData.file_name;
+
+    // If Box didn't substitute {file_name}, fetch it from the API
+    if (!fileName || fileName === '{file_name}') {
+      try {
+        const { data: fileInfo } = await axios.get(
+          `https://api.box.com/2.0/files/${stateData.file_id}?fields=name`,
+          { headers: { Authorization: `Bearer ${accessToken}` } }
+        );
+        fileName = fileInfo.name;
+      } catch {
+        fileName = 'document.pdf';
+      }
+    }
+
+    res.send(renderApp(stateData.file_id, fileName, accessToken));
   } catch (err) {
     const msg = err.response?.data?.error_description || err.message;
     res.status(500).send(renderError('OAuth Failed', msg));
