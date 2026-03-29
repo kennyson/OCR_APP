@@ -1,19 +1,17 @@
 require('dotenv').config();
 const express = require('express');
-const session = require('express-session');
 const axios = require('axios');
 const FormData = require('form-data');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
-const crypto = require('crypto');
 const { execFile } = require('child_process');
 const { promisify } = require('util');
 
 const execFileAsync = promisify(execFile);
 const app = express();
 const PORT = process.env.PORT || 3000;
-const BASE_URL = process.env.BASE_URL; // e.g. https://ocr-app-axpq.onrender.com
+const BASE_URL = (process.env.BASE_URL || '').replace(/\/$/, '');
 const CLIENT_ID = process.env.BOX_CLIENT_ID;
 const CLIENT_SECRET = process.env.BOX_CLIENT_SECRET;
 
@@ -21,13 +19,6 @@ if (!CLIENT_ID || !CLIENT_SECRET || !BASE_URL) {
   console.error('Missing required env vars: BOX_CLIENT_ID, BOX_CLIENT_SECRET, BASE_URL');
   process.exit(1);
 }
-
-app.use(session({
-  secret: process.env.SESSION_SECRET || crypto.randomBytes(32).toString('hex'),
-  resave: false,
-  saveUninitialized: false,
-  cookie: { secure: BASE_URL.startsWith('https'), maxAge: 3600000 }
-}));
 
 app.use(express.json());
 app.use(express.static(path.join(__dirname, 'public')));
@@ -38,25 +29,15 @@ app.use(express.static(path.join(__dirname, 'public')));
 // Execute URL: https://domain/ocr?file_id={file_id}&file_name={file_name}
 app.get('/ocr', (req, res) => {
   const { file_id, file_name } = req.query;
+  if (!file_id) return res.status(400).send('Missing file_id');
 
-  if (!file_id) {
-    return res.status(400).send('Missing file_id');
-  }
+  // Encode file context in the OAuth state parameter — no session needed
+  const state = Buffer.from(JSON.stringify({
+    file_id,
+    file_name: file_name || 'document.pdf'
+  })).toString('base64url');
 
-  // Store file context in session so we can retrieve it after OAuth redirect
-  req.session.file_id = file_id;
-  req.session.file_name = file_name || 'document.pdf';
-
-  // If already authenticated, serve the app
-  if (req.session.access_token) {
-    return res.send(renderApp(file_id, file_name || 'document.pdf'));
-  }
-
-  // Otherwise, start OAuth flow
-  const state = crypto.randomBytes(16).toString('hex');
-  req.session.oauth_state = state;
-
-  const authUrl = `https://account.box.com/api/oauth2/authorize?` +
+  const authUrl = 'https://account.box.com/api/oauth2/authorize?' +
     `client_id=${CLIENT_ID}` +
     `&response_type=code` +
     `&redirect_uri=${encodeURIComponent(BASE_URL + '/callback')}` +
@@ -65,56 +46,53 @@ app.get('/ocr', (req, res) => {
   res.redirect(authUrl);
 });
 
-// OAuth callback
+// OAuth callback — exchange code for token, render the app
 app.get('/callback', async (req, res) => {
   const { code, state } = req.query;
 
-  if (!code || state !== req.session.oauth_state) {
-    return res.status(400).send('Invalid OAuth callback');
+  if (!code || !state) {
+    return res.status(400).send(renderError('OAuth Error', 'Missing code or state parameter.'));
+  }
+
+  let stateData;
+  try {
+    stateData = JSON.parse(Buffer.from(state, 'base64url').toString());
+  } catch {
+    return res.status(400).send(renderError('OAuth Error', 'Invalid state parameter.'));
   }
 
   try {
-    const { data } = await axios.post('https://api.box.com/oauth2/token', new URLSearchParams({
-      grant_type: 'authorization_code',
-      code,
-      client_id: CLIENT_ID,
-      client_secret: CLIENT_SECRET,
-      redirect_uri: BASE_URL + '/callback'
-    }));
+    const { data } = await axios.post(
+      'https://api.box.com/oauth2/token',
+      new URLSearchParams({
+        grant_type: 'authorization_code',
+        code,
+        client_id: CLIENT_ID,
+        client_secret: CLIENT_SECRET,
+        redirect_uri: BASE_URL + '/callback'
+      }),
+      { headers: { 'Content-Type': 'application/x-www-form-urlencoded' } }
+    );
 
-    req.session.access_token = data.access_token;
-    req.session.refresh_token = data.refresh_token;
-    delete req.session.oauth_state;
-
-    // Redirect back to the OCR page with the stored file context
-    const fileId = req.session.file_id;
-    const fileName = req.session.file_name;
-    res.redirect(`/ocr?file_id=${fileId}&file_name=${encodeURIComponent(fileName)}`);
+    // Embed the token directly in the page — no server-side session needed
+    res.send(renderApp(stateData.file_id, stateData.file_name, data.access_token));
   } catch (err) {
     const msg = err.response?.data?.error_description || err.message;
-    res.status(500).send(`OAuth failed: ${msg}`);
+    res.status(500).send(renderError('OAuth Failed', msg));
   }
 });
 
-// Middleware: refresh token if expired
-async function ensureToken(req, res, next) {
-  if (!req.session.access_token) {
-    return res.status(401).json({ error: 'Not authenticated' });
-  }
-  next();
-}
-
-// ── API routes ──────────────────────────────────────────────────────────────
+// ── API routes (token passed from client) ───────────────────────────────────
 
 // Get parent folder's PDFs
-app.get('/api/folder-pdfs', ensureToken, async (req, res) => {
-  const { file_id } = req.query;
-  const token = req.session.access_token;
+app.get('/api/folder-pdfs', async (req, res) => {
+  const { file_id, access_token } = req.query;
+  if (!access_token) return res.status(401).json({ error: 'Not authenticated' });
 
   try {
     const { data: fileInfo } = await axios.get(
       `https://api.box.com/2.0/files/${file_id}?fields=parent`,
-      { headers: { Authorization: `Bearer ${token}` } }
+      { headers: { Authorization: `Bearer ${access_token}` } }
     );
 
     const folderId = fileInfo.parent.id;
@@ -127,7 +105,7 @@ app.get('/api/folder-pdfs', ensureToken, async (req, res) => {
 
       const { data } = await axios.get(
         `https://api.box.com/2.0/folders/${folderId}/items`,
-        { headers: { Authorization: `Bearer ${token}` }, params }
+        { headers: { Authorization: `Bearer ${access_token}` }, params }
       );
 
       for (const item of data.entries) {
@@ -140,17 +118,15 @@ app.get('/api/folder-pdfs', ensureToken, async (req, res) => {
 
     res.json({ folder_name: fileInfo.parent.name, pdfs });
   } catch (err) {
-    if (err.response?.status === 401) {
-      return await tryRefreshAndRetry(req, res, () => res.redirect(req.originalUrl));
-    }
     res.status(500).json({ error: err.response?.data?.message || err.message });
   }
 });
 
 // OCR a single file
-app.post('/api/ocr', ensureToken, async (req, res) => {
-  const { file_id, file_name } = req.body;
-  const token = req.session.access_token;
+app.post('/api/ocr', async (req, res) => {
+  const { file_id, file_name, access_token } = req.body;
+  if (!access_token) return res.status(401).json({ error: 'Not authenticated' });
+
   const inputPath = path.join(os.tmpdir(), `box-ocr-in-${file_id}.pdf`);
   const outputPath = path.join(os.tmpdir(), `box-ocr-out-${file_id}.pdf`);
 
@@ -158,7 +134,7 @@ app.post('/api/ocr', ensureToken, async (req, res) => {
     // Download
     const { data } = await axios.get(
       `https://api.box.com/2.0/files/${file_id}/content`,
-      { headers: { Authorization: `Bearer ${token}` }, responseType: 'arraybuffer' }
+      { headers: { Authorization: `Bearer ${access_token}` }, responseType: 'arraybuffer' }
     );
     fs.writeFileSync(inputPath, data);
 
@@ -176,14 +152,11 @@ app.post('/api/ocr', ensureToken, async (req, res) => {
     await axios.post(
       `https://upload.box.com/api/2.0/files/${file_id}/content`,
       form,
-      { headers: { Authorization: `Bearer ${token}`, ...form.getHeaders() } }
+      { headers: { Authorization: `Bearer ${access_token}`, ...form.getHeaders() } }
     );
 
     res.json({ success: true });
   } catch (err) {
-    if (err.response?.status === 401) {
-      return await tryRefreshAndRetry(req, res, () => res.status(401).json({ error: 'Token expired, please reload' }));
-    }
     const msg = err.response?.data?.message || err.message;
     res.status(500).json({ error: msg });
   } finally {
@@ -192,30 +165,9 @@ app.post('/api/ocr', ensureToken, async (req, res) => {
   }
 });
 
-// Token refresh helper
-async function tryRefreshAndRetry(req, res, fallback) {
-  if (!req.session.refresh_token) return fallback();
+// ── HTML templates ───────────────────────────────────────────────────────────
 
-  try {
-    const { data } = await axios.post('https://api.box.com/oauth2/token', new URLSearchParams({
-      grant_type: 'refresh_token',
-      refresh_token: req.session.refresh_token,
-      client_id: CLIENT_ID,
-      client_secret: CLIENT_SECRET
-    }));
-
-    req.session.access_token = data.access_token;
-    req.session.refresh_token = data.refresh_token;
-    return fallback();
-  } catch {
-    req.session.destroy(() => {});
-    return res.status(401).json({ error: 'Session expired, please reopen from Box' });
-  }
-}
-
-// ── App UI ──────────────────────────────────────────────────────────────────
-
-function renderApp(fileId, fileName) {
+function renderApp(fileId, fileName, accessToken) {
   return `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -258,6 +210,7 @@ function renderApp(fileId, fileName) {
   <script>
     const FILE_ID = ${JSON.stringify(fileId)};
     const FILE_NAME = ${JSON.stringify(fileName)};
+    const TOKEN = ${JSON.stringify(accessToken)};
     const log = document.getElementById('log');
     const summary = document.getElementById('summary');
 
@@ -301,7 +254,7 @@ function renderApp(fileId, fileName) {
       const res = await fetch('/api/ocr', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ file_id: fileId, file_name: fileName })
+        body: JSON.stringify({ file_id: fileId, file_name: fileName, access_token: TOKEN })
       });
       if (!res.ok) {
         const data = await res.json().catch(() => ({}));
@@ -331,7 +284,7 @@ function renderApp(fileId, fileName) {
       summary.innerHTML = '';
 
       try {
-        const res = await fetch('/api/folder-pdfs?file_id=' + FILE_ID);
+        const res = await fetch('/api/folder-pdfs?file_id=' + FILE_ID + '&access_token=' + encodeURIComponent(TOKEN));
         const { pdfs, folder_name, error } = await res.json();
         if (error) throw new Error(error);
         if (!pdfs || pdfs.length === 0) {
@@ -369,6 +322,33 @@ function renderApp(fileId, fileName) {
   </script>
 </body>
 </html>`;
+}
+
+function renderError(title, detail) {
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Error – Box OCR</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #f5f5f5; display: flex; align-items: center; justify-content: center; min-height: 100vh; }
+    .card { background: #fff; border-radius: 8px; box-shadow: 0 1px 4px rgba(0,0,0,0.1); padding: 40px; max-width: 500px; text-align: center; }
+    h1 { font-size: 20px; color: #c00; margin-bottom: 12px; }
+    p { color: #555; line-height: 1.5; font-size: 14px; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>${escHtml(title)}</h1>
+    <p>${escHtml(detail)}</p>
+  </div>
+</body>
+</html>`;
+}
+
+function escHtml(str) {
+  return String(str).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }
 
 app.listen(PORT, () => {
