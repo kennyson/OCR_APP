@@ -49,8 +49,6 @@ const progressMap    = new Map(); // requestId → { current, total }
 
 // ── Service token storage (for automated webhook OCR) ────────────────────────
 const SERVICE_TOKEN_FILE = path.join(os.tmpdir(), 'box-ocr-service-token.json');
-const WATCHED_FOLDERS_FILE = path.join(os.tmpdir(), 'box-ocr-watched-folders.json');
-
 function saveServiceToken(refreshToken) {
   try {
     fs.writeFileSync(SERVICE_TOKEN_FILE, JSON.stringify({ refreshToken }));
@@ -71,13 +69,22 @@ async function getServiceAccessToken() {
   return tokens.access_token;
 }
 
-function loadWatchedFolders() {
-  try { return JSON.parse(fs.readFileSync(WATCHED_FOLDERS_FILE, 'utf8')); }
-  catch { return {}; }
+// ── Box webhook list helpers ──────────────────────────────────────────────────
+async function listOurWebhooks(accessToken) {
+  const { data } = await axios.get('https://api.box.com/2.0/webhooks?limit=100', {
+    headers: { Authorization: `Bearer ${accessToken}` }
+  });
+  return (data.entries || []).filter(w => w.address === BASE_URL + '/webhook' && w.target.type === 'folder');
 }
 
-function saveWatchedFolders(data) {
-  fs.writeFileSync(WATCHED_FOLDERS_FILE, JSON.stringify(data));
+async function getFolderName(folderId, accessToken) {
+  try {
+    const { data } = await axios.get(
+      `https://api.box.com/2.0/folders/${folderId}?fields=name`,
+      { headers: { Authorization: `Bearer ${accessToken}` } }
+    );
+    return data.name;
+  } catch { return folderId; }
 }
 
 // ── Webhook signature validation ──────────────────────────────────────────────
@@ -324,9 +331,21 @@ app.get('/api/folder-pdfs', async (req, res) => {
   }
 });
 
-// ── API: watched folders ──────────────────────────────────────────────────────
-app.get('/api/watched-folders', (req, res) => {
-  res.json(loadWatchedFolders());
+/// ── API: list watched folders (live from Box webhook registry) ────────────────
+app.get('/api/watched-folders', async (req, res) => {
+  const { access_token } = req.query;
+  if (!access_token) return res.status(401).json({ error: 'Not authenticated' });
+  try {
+    const webhooks = await listOurWebhooks(access_token);
+    const names = await Promise.all(webhooks.map(w => getFolderName(w.target.id, access_token)));
+    const result = {};
+    webhooks.forEach((w, i) => {
+      result[w.target.id] = { webhookId: w.id, folderName: names[i] };
+    });
+    res.json(result);
+  } catch (err) {
+    res.status(500).json({ error: err.response?.data?.message || err.message });
+  }
 });
 
 app.post('/api/watch-folder', async (req, res) => {
@@ -334,8 +353,10 @@ app.post('/api/watch-folder', async (req, res) => {
   if (!access_token) return res.status(401).json({ error: 'Not authenticated' });
 
   try {
-    const watched = loadWatchedFolders();
-    if (watched[folder_id]) return res.json({ ok: true, alreadyWatching: true });
+    // Check if already watching (via Box registry)
+    const existing = await listOurWebhooks(access_token);
+    const already = existing.find(w => w.target.id === folder_id);
+    if (already) return res.json({ ok: true, alreadyWatching: true, webhookId: already.id });
 
     const { data } = await axios.post(
       'https://api.box.com/2.0/webhooks',
@@ -347,8 +368,6 @@ app.post('/api/watch-folder', async (req, res) => {
       { headers: { Authorization: `Bearer ${access_token}`, 'Content-Type': 'application/json' } }
     );
 
-    watched[folder_id] = { webhookId: data.id, folderName: folder_name };
-    saveWatchedFolders(watched);
     res.json({ ok: true, webhookId: data.id });
   } catch (err) {
     res.status(500).json({ error: err.response?.data?.message || err.message });
@@ -360,13 +379,13 @@ app.post('/api/unwatch-folder', async (req, res) => {
   if (!access_token) return res.status(401).json({ error: 'Not authenticated' });
 
   try {
-    const watched = loadWatchedFolders();
-    const entry = watched[folder_id];
+    const existing = await listOurWebhooks(access_token);
+    const entry = existing.find(w => w.target.id === folder_id);
     if (!entry) return res.json({ ok: true, notWatching: true });
 
     try {
       await axios.delete(
-        `https://api.box.com/2.0/webhooks/${entry.webhookId}`,
+        `https://api.box.com/2.0/webhooks/${entry.id}`,
         { headers: { Authorization: `Bearer ${access_token}` } }
       );
     } catch (e) {
@@ -374,8 +393,6 @@ app.post('/api/unwatch-folder', async (req, res) => {
       console.log('Webhook delete warning:', e.response?.data?.message || e.message);
     }
 
-    delete watched[folder_id];
-    saveWatchedFolders(watched);
     res.json({ ok: true });
   } catch (err) {
     res.status(500).json({ error: err.response?.data?.message || err.message });
@@ -856,7 +873,7 @@ function renderApp(fileId, fileName, accessToken) {
       try {
         const [folderRes, watchedRes] = await Promise.all([
           fetch('/api/folder-pdfs?file_id=' + FILE_ID + '&access_token=' + encodeURIComponent(TOKEN)),
-          fetch('/api/watched-folders')
+          fetch('/api/watched-folders?access_token=' + encodeURIComponent(TOKEN))
         ]);
         const folderData  = await folderRes.json();
         watchedFolders    = await watchedRes.json();
