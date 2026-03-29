@@ -47,24 +47,61 @@ function decrypt(data) {
 const activeProcesses = new Map(); // requestId → ChildProcess
 const progressMap    = new Map(); // requestId → { current, total }
 
-// ── Service token storage (for automated webhook OCR) ────────────────────────
-const SERVICE_TOKEN_FILE = path.join(os.tmpdir(), 'box-ocr-service-token.json');
-function saveServiceToken(refreshToken) {
+// ── Service token storage — /tmp cache + Supabase for persistence ─────────────
+const SERVICE_TOKEN_FILE  = path.join(os.tmpdir(), 'box-ocr-service-token.json');
+const SUPABASE_URL         = (process.env.SUPABASE_URL || '').replace(/\/$/, '');
+const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY || '';
+
+async function saveServiceTokenDB(encryptedToken) {
+  if (!SUPABASE_URL || !SUPABASE_SERVICE_KEY) return;
   try {
-    fs.writeFileSync(SERVICE_TOKEN_FILE, JSON.stringify({ refreshToken }));
-  } catch (e) {
-    console.error('Failed to save service token:', e.message);
-  }
+    await axios.post(
+      `${SUPABASE_URL}/rest/v1/ocr_service_token`,
+      { id: 1, token: encryptedToken, updated_at: new Date().toISOString() },
+      {
+        headers: {
+          apikey: SUPABASE_SERVICE_KEY,
+          Authorization: `Bearer ${SUPABASE_SERVICE_KEY}`,
+          'Content-Type': 'application/json',
+          Prefer: 'resolution=merge-duplicates'
+        }
+      }
+    );
+  } catch (e) { console.error('Supabase token save failed:', e.message); }
+}
+
+async function loadServiceTokenDB() {
+  if (!SUPABASE_URL || !SUPABASE_SERVICE_KEY) return null;
+  try {
+    const { data } = await axios.get(
+      `${SUPABASE_URL}/rest/v1/ocr_service_token?id=eq.1&select=token`,
+      { headers: { apikey: SUPABASE_SERVICE_KEY, Authorization: `Bearer ${SUPABASE_SERVICE_KEY}` } }
+    );
+    return data?.[0]?.token || null;
+  } catch (e) { console.error('Supabase token load failed:', e.message); return null; }
+}
+
+function saveServiceToken(refreshToken) {
+  // Write to /tmp for fast same-session reads
+  try { fs.writeFileSync(SERVICE_TOKEN_FILE, JSON.stringify({ refreshToken })); } catch {}
+  // Persist encrypted to Supabase — survives server restarts and spin-downs
+  saveServiceTokenDB(encrypt(refreshToken));
 }
 
 async function getServiceAccessToken() {
-  let stored;
-  try {
-    stored = JSON.parse(fs.readFileSync(SERVICE_TOKEN_FILE, 'utf8'));
-  } catch {
-    throw new Error('No service token. Open the OCR app in Box once to re-authenticate.');
+  let refreshToken;
+
+  // 1. Fast path: /tmp (exists within same server session)
+  try { refreshToken = JSON.parse(fs.readFileSync(SERVICE_TOKEN_FILE, 'utf8')).refreshToken; } catch {}
+
+  // 2. Supabase fallback (survives restarts — token stored encrypted at rest)
+  if (!refreshToken) {
+    const enc = await loadServiceTokenDB();
+    if (enc) refreshToken = decrypt(enc);
   }
-  const tokens = await refreshAccessToken(stored.refreshToken);
+
+  if (!refreshToken) throw new Error('No service token. Open the OCR app in Box to authenticate.');
+  const tokens = await refreshAccessToken(refreshToken);
   saveServiceToken(tokens.refresh_token);
   return tokens.access_token;
 }
@@ -409,8 +446,17 @@ app.post('/api/unwatch-folder', async (req, res) => {
 async function ocrByPage(inputPath, outputPath, requestId) {
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'box-ocr-pages-'));
   try {
-    const { stdout } = await execFileAsync('qpdf', ['--show-npages', inputPath]);
-    const pageCount = parseInt(stdout.trim(), 10);
+    // --warning-exit-0: exit 0 even when qpdf repairs a damaged PDF
+    let npagesStdout;
+    try {
+      ({ stdout: npagesStdout } = await execFileAsync('qpdf', ['--warning-exit-0', '--show-npages', inputPath]));
+    } catch (err) {
+      // Older qpdf without --warning-exit-0, or non-fatal warnings: try stdout anyway
+      if (!err.stdout?.trim()) throw err;
+      npagesStdout = err.stdout;
+    }
+    const pageCount = parseInt(npagesStdout.trim(), 10);
+    if (!pageCount || pageCount < 1) throw new Error('Could not determine page count');
     console.log(`OCR: splitting ${pageCount} pages`);
     if (requestId) progressMap.set(requestId, { current: 0, total: pageCount });
 
@@ -420,7 +466,12 @@ async function ocrByPage(inputPath, outputPath, requestId) {
       const pageIn  = path.join(tmpDir, `page-${i}-in.pdf`);
       const pageOut = path.join(tmpDir, `page-${i}-out.pdf`);
 
-      await execFileAsync('qpdf', ['--empty', '--pages', inputPath, String(i), '--', pageIn]);
+      try {
+        await execFileAsync('qpdf', ['--warning-exit-0', '--empty', '--pages', inputPath, String(i), '--', pageIn]);
+      } catch (err) {
+        // Non-fatal: qpdf repaired the page but exited non-zero
+        if (!fs.existsSync(pageIn)) throw err;
+      }
 
       const proc = execFile('ocrmypdf', [
         '--skip-text', '--jobs', '1', '--output-type', 'pdf', '--fast-web-view', '0',
@@ -445,7 +496,7 @@ async function ocrByPage(inputPath, outputPath, requestId) {
       ocrPagePaths.push(pageOut);
     }
 
-    await execFileAsync('qpdf', ['--empty', '--pages', ...ocrPagePaths, '--', outputPath]);
+    await execFileAsync('qpdf', ['--warning-exit-0', '--empty', '--pages', ...ocrPagePaths, '--', outputPath]);
   } finally {
     if (requestId) progressMap.delete(requestId);
     try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch {}
