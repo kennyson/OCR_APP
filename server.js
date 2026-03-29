@@ -45,6 +45,7 @@ function decrypt(data) {
 
 // ── In-flight OCR processes (for cancel support) ─────────────────────────────
 const activeProcesses = new Map(); // requestId → ChildProcess
+const progressMap    = new Map(); // requestId → { current, total }
 
 // ── Service token storage (for automated webhook OCR) ────────────────────────
 const SERVICE_TOKEN_FILE = path.join(os.tmpdir(), 'box-ocr-service-token.json');
@@ -220,6 +221,18 @@ app.post('/ocr-ui', upload.none(), async (req, res) => {
     }
   }
 
+  // Fallback: try stored service token (fixes repeated Grant Access when browser blocks cookies)
+  try {
+    const stored = JSON.parse(fs.readFileSync(SERVICE_TOKEN_FILE, 'utf8'));
+    const tokens = await refreshAccessToken(stored.refreshToken);
+    saveServiceToken(tokens.refresh_token);
+    setRefreshCookie(res, tokens.refresh_token);
+    const fileName = file_name || await getFileName(file_id, tokens.access_token);
+    return res.send(renderApp(file_id, fileName, tokens.access_token));
+  } catch (e) {
+    console.log('Service token fallback failed, starting OAuth:', e.message);
+  }
+
   // Fall through to OAuth
   const state = Buffer.from(JSON.stringify({
     file_id,
@@ -376,6 +389,7 @@ async function ocrByPage(inputPath, outputPath, requestId) {
     const { stdout } = await execFileAsync('qpdf', ['--show-npages', inputPath]);
     const pageCount = parseInt(stdout.trim(), 10);
     console.log(`OCR: splitting ${pageCount} pages`);
+    if (requestId) progressMap.set(requestId, { current: 0, total: pageCount });
 
     const ocrPagePaths = [];
 
@@ -404,11 +418,13 @@ async function ocrByPage(inputPath, outputPath, requestId) {
         });
       });
 
+      if (requestId) progressMap.set(requestId, { current: i, total: pageCount });
       ocrPagePaths.push(pageOut);
     }
 
     await execFileAsync('qpdf', ['--empty', '--pages', ...ocrPagePaths, '--', outputPath]);
   } finally {
+    if (requestId) progressMap.delete(requestId);
     try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch {}
   }
 }
@@ -532,6 +548,7 @@ function renderApp(fileId, fileName, accessToken) {
       <button id="btn-cancel" class="danger" onclick="cancelOcr()" style="display:none;">Cancel</button>
     </div>
     <div id="log"></div>
+    <p id="hint" style="font-size:12px;color:#666;font-style:italic;margin-top:8px;"></p>
     <div id="summary"></div>
   </div>
 
@@ -607,15 +624,31 @@ function renderApp(fileId, fileName, accessToken) {
     async function ocrOne(fileId, fileName) {
       const reqId = genId();
       currentRequestId = reqId;
-      const res = await fetch('/api/ocr', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ file_id: fileId, file_name: fileName, access_token: TOKEN, request_id: reqId })
-      });
-      const data = await res.json().catch(() => ({}));
-      if (data.cancelled) return 'cancelled';
-      if (!res.ok) throw new Error(data.error || 'Failed');
-      return 'done';
+      const pollInterval = setInterval(async () => {
+        try {
+          const r = await fetch('/api/progress/' + reqId);
+          const p = await r.json();
+          if (p.total > 0) {
+            const el = document.getElementById('entry-' + fileId);
+            if (el) el.querySelector('.status').textContent = 'page ' + p.current + ' of ' + p.total;
+            document.title = 'OCR: ' + p.current + '/' + p.total + ' pages';
+          }
+        } catch {}
+      }, 1500);
+      try {
+        const res = await fetch('/api/ocr', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ file_id: fileId, file_name: fileName, access_token: TOKEN, request_id: reqId })
+        });
+        const data = await res.json().catch(() => ({}));
+        if (data.cancelled) return 'cancelled';
+        if (!res.ok) throw new Error(data.error || 'Failed');
+        return 'done';
+      } finally {
+        clearInterval(pollInterval);
+        document.title = 'Box PDF OCR';
+      }
     }
 
     async function cancelOcr() {
@@ -633,6 +666,7 @@ function renderApp(fileId, fileName, accessToken) {
     async function ocrSingleFile() {
       cancelled = false;
       disable(true); showCancel(true); log.innerHTML = ''; summary.innerHTML = '';
+      document.getElementById('hint').textContent = 'Processing\u2026 you can minimize this window.';
       addEntry(FILE_ID, FILE_NAME);
       try {
         const result = await ocrOne(FILE_ID, FILE_NAME);
@@ -642,12 +676,14 @@ function renderApp(fileId, fileName, accessToken) {
         updateEntry(FILE_ID, false, e.message);
         showSummary(0, 1, 0);
       }
+      document.getElementById('hint').textContent = '';
       showCancel(false); disable(false);
     }
 
     async function ocrFolder() {
       cancelled = false;
       disable(true); showCancel(true); log.innerHTML = ''; summary.innerHTML = '';
+      document.getElementById('hint').textContent = 'Processing\u2026 you can minimize this window.';
       try {
         const res = await fetch('/api/folder-pdfs?file_id=' + FILE_ID + '&access_token=' + encodeURIComponent(TOKEN));
         const { pdfs, folder_name, error } = await res.json();
@@ -672,6 +708,7 @@ function renderApp(fileId, fileName, accessToken) {
         summary.className = 'summary err';
         summary.textContent = 'Error: ' + e.message;
       }
+      document.getElementById('hint').textContent = '';
       showCancel(false); disable(false);
     }
 
@@ -800,5 +837,11 @@ function renderError(title, detail) {
 function escHtml(str) {
   return String(str).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }
+
+// ── API: OCR progress ─────────────────────────────────────────────────────────
+app.get('/api/progress/:request_id', (req, res) => {
+  const p = progressMap.get(req.params.request_id);
+  res.json(p || { current: 0, total: 0 });
+});
 
 app.listen(PORT, () => console.log(`Box PDF OCR server running at http://localhost:${PORT}`));
