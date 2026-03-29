@@ -9,6 +9,9 @@ const crypto = require('crypto');
 const { execFile } = require('child_process');
 const { promisify } = require('util');
 
+const multer = require('multer');
+const upload = multer();
+
 const execFileAsync = promisify(execFile);
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -44,7 +47,7 @@ app.use(express.static(path.join(__dirname, 'public')));
 // ── Box callback — POST from Box with file_id and file_name ──────────────────
 // Box POSTs here when user triggers the integration.
 // Start OAuth flow with file context stored in the state parameter.
-app.post('/ocr-ui', (req, res) => {
+app.post('/ocr-ui', upload.none(), (req, res) => {
   // Box may send params in body or query string
   const file_id = req.body.file_id || req.query.file_id;
   const file_name = req.body.file_name || req.query.file_name;
