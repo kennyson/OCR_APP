@@ -21,6 +21,10 @@ if (!CLIENT_ID || !CLIENT_SECRET || !BASE_URL) {
 }
 
 app.use(express.json());
+app.use((req, res, next) => {
+  console.log(`${req.method} ${req.url}`);
+  next();
+});
 app.use(express.static(path.join(__dirname, 'public')));
 
 // ── OAuth flow ──────────────────────────────────────────────────────────────
