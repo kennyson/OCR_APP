@@ -227,24 +227,38 @@ app.post('/ocr-ui', upload.none(), async (req, res) => {
   res.send(renderGateway(file_id, file_name || '', authUrl));
 });
 
-// ── API: silent token refresh using localStorage-stored encrypted token ────────
+// ── API: silent token refresh — tries localStorage token, then service token ───
 app.post('/api/use-stored-token', async (req, res) => {
   const { encrypted_refresh, file_id, file_name } = req.body;
-  if (!encrypted_refresh || !file_id) return res.status(400).json({ error: 'Missing params' });
+  if (!file_id) return res.status(400).json({ error: 'Missing file_id' });
+
+  // 1. Try client-supplied encrypted refresh token (from localStorage)
+  if (encrypted_refresh) {
+    try {
+      const refreshToken = decrypt(encrypted_refresh);
+      const tokens = await refreshAccessToken(refreshToken);
+      saveServiceToken(tokens.refresh_token);
+      const fileName = file_name || await getFileName(file_id, tokens.access_token);
+      const newEncRefresh = encrypt(tokens.refresh_token);
+      return res.json({ enc_refresh: newEncRefresh, html: renderApp(file_id, fileName, tokens.access_token, newEncRefresh) });
+    } catch (e) {
+      console.log('Client stored token failed:', e.message);
+    }
+  }
+
+  // 2. Fallback: server-side service token (survives browser storage restrictions)
   try {
-    const refreshToken = decrypt(encrypted_refresh);
-    const tokens = await refreshAccessToken(refreshToken);
+    const stored = JSON.parse(fs.readFileSync(SERVICE_TOKEN_FILE, 'utf8'));
+    const tokens = await refreshAccessToken(stored.refreshToken);
     saveServiceToken(tokens.refresh_token);
     const fileName = file_name || await getFileName(file_id, tokens.access_token);
     const newEncRefresh = encrypt(tokens.refresh_token);
-    res.json({
-      enc_refresh: newEncRefresh,
-      html: renderApp(file_id, fileName, tokens.access_token, newEncRefresh)
-    });
-  } catch (err) {
-    console.log('Stored token refresh failed:', err.message);
-    res.status(401).json({ error: 'Token expired' });
+    return res.json({ enc_refresh: newEncRefresh, html: renderApp(file_id, fileName, tokens.access_token, newEncRefresh) });
+  } catch (e) {
+    console.log('Service token fallback failed:', e.message);
   }
+
+  res.status(401).json({ error: 'No valid token — please re-authorize' });
 });
 
 // ── OAuth callback ────────────────────────────────────────────────────────────
@@ -515,23 +529,23 @@ function renderGateway(fileId, fileName, authUrl) {
   <p>Loading\u2026</p>
   <script>
     (async () => {
-      const stored = localStorage.getItem('box_ocr_rt');
-      if (stored) {
-        try {
-          const r = await fetch('/api/use-stored-token', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ encrypted_refresh: stored, file_id: ${JSON.stringify(fileId)}, file_name: ${JSON.stringify(fileName)} })
-          });
-          if (r.ok) {
-            const { enc_refresh, html } = await r.json();
-            localStorage.setItem('box_ocr_rt', enc_refresh);
-            document.open(); document.write(html); document.close();
-            return;
-          }
-          localStorage.removeItem('box_ocr_rt');
-        } catch (e) { localStorage.removeItem('box_ocr_rt'); }
-      }
+      // Always call use-stored-token — it tries localStorage token first,
+      // then falls back to the server-side service token. OAuth only if both fail.
+      const stored = (() => { try { return localStorage.getItem('box_ocr_rt'); } catch(e) { return null; } })();
+      try {
+        const r = await fetch('/api/use-stored-token', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ encrypted_refresh: stored, file_id: ${JSON.stringify(fileId)}, file_name: ${JSON.stringify(fileName)} })
+        });
+        if (r.ok) {
+          const { enc_refresh, html } = await r.json();
+          try { if (enc_refresh) localStorage.setItem('box_ocr_rt', enc_refresh); } catch(e) {}
+          document.open(); document.write(html); document.close();
+          return;
+        }
+      } catch (e) {}
+      try { localStorage.removeItem('box_ocr_rt'); } catch(e) {}
       window.location.href = ${JSON.stringify(authUrl)};
     })();
   </script>
