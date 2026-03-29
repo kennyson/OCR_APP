@@ -38,67 +38,72 @@ app.use((req, res, next) => {
 });
 app.use(express.static(path.join(__dirname, 'public')));
 
-// ── Box server-side callback ─────────────────────────────────────────────────
-// Box POSTs here with file info before redirecting the browser.
-// Configure this as the "Server Callback URL" in Box Developer Console.
-app.post('/box-callback', async (req, res) => {
-  console.log('Box server callback body:', req.body);
-  const { typedID, authCode } = req.body;
+// ── Box callback — POST from Box with file_id and file_name ──────────────────
+// Box POSTs here when user triggers the integration.
+// Start OAuth flow with file context stored in the state parameter.
+app.post('/ocr-ui', (req, res) => {
+  console.log('Box POST to /ocr-ui:', req.body);
+  const { file_id, file_name } = req.body;
+  if (!file_id) return res.status(400).send(renderError('Missing file_id', 'No file ID was provided by Box.'));
 
-  if (!typedID || !authCode) {
-    return res.status(400).json({ error: 'Missing typedID or authCode' });
+  const state = Buffer.from(JSON.stringify({
+    file_id,
+    file_name: file_name || 'document.pdf'
+  })).toString('base64url');
+
+  const authUrl = 'https://account.box.com/api/oauth2/authorize?' +
+    `client_id=${CLIENT_ID}` +
+    `&response_type=code` +
+    `&redirect_uri=${encodeURIComponent(BASE_URL + '/callback')}` +
+    `&state=${state}`;
+
+  res.redirect(authUrl);
+});
+
+// ── OAuth callback ────────────────────────────────────────────────────────────
+app.get('/callback', async (req, res) => {
+  const { code, state } = req.query;
+  if (!code || !state) return res.status(400).send(renderError('OAuth Error', 'Missing code or state.'));
+
+  let stateData;
+  try {
+    stateData = JSON.parse(Buffer.from(state, 'base64url').toString());
+  } catch {
+    return res.status(400).send(renderError('OAuth Error', 'Invalid state parameter.'));
   }
 
-  // typedID format: "file_12345" or just "12345"
-  const fileId = typedID.replace(/^file_/, '');
-
   try {
-    // Exchange the one-time auth code for an access token
-    const { data: tokenData } = await axios.post(
+    const { data } = await axios.post(
       'https://api.box.com/oauth2/token',
       new URLSearchParams({
         grant_type: 'authorization_code',
-        code: authCode,
+        code,
         client_id: CLIENT_ID,
-        client_secret: CLIENT_SECRET
+        client_secret: CLIENT_SECRET,
+        redirect_uri: BASE_URL + '/callback'
       }),
       { headers: { 'Content-Type': 'application/x-www-form-urlencoded' } }
     );
 
-    const jobId = createJob(fileId, tokenData.access_token);
+    const accessToken = data.access_token;
+    let fileName = stateData.file_name;
 
-    // Tell Box where to send the user's browser
-    res.json({ client_callback_url: `${BASE_URL}/ocr-ui?job=${jobId}` });
+    // If Box didn't provide file_name, fetch it
+    if (!fileName || fileName === '{file_name}' || fileName === '#file_name#') {
+      try {
+        const { data: fileInfo } = await axios.get(
+          `https://api.box.com/2.0/files/${stateData.file_id}?fields=name`,
+          { headers: { Authorization: `Bearer ${accessToken}` } }
+        );
+        fileName = fileInfo.name;
+      } catch { fileName = 'document.pdf'; }
+    }
+
+    res.send(renderApp(stateData.file_id, fileName, accessToken));
   } catch (err) {
-    console.error('Token exchange error:', err.response?.data || err.message);
-    res.status(500).json({ error: 'Authentication failed' });
+    const msg = err.response?.data?.error_description || err.message;
+    res.status(500).send(renderError('OAuth Failed', msg));
   }
-});
-
-// ── Client UI ────────────────────────────────────────────────────────────────
-// Box redirects the user's browser here after the server callback.
-// Configure this as the "Client Callback URL" in Box Developer Console.
-app.get('/ocr-ui', async (req, res) => {
-  const job = jobs.get(req.query.job);
-  if (!job) {
-    return res.status(400).send(renderError(
-      'Session expired',
-      'Please re-open this integration from Box.'
-    ));
-  }
-
-  let fileName = 'document.pdf';
-  try {
-    const { data } = await axios.get(
-      `https://api.box.com/2.0/files/${job.fileId}?fields=name`,
-      { headers: { Authorization: `Bearer ${job.token}` } }
-    );
-    fileName = data.name;
-  } catch (err) {
-    console.error('Failed to get file name:', err.message);
-  }
-
-  res.send(renderApp(job.fileId, fileName, job.token));
 });
 
 // ── API routes ───────────────────────────────────────────────────────────────
