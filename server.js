@@ -218,17 +218,33 @@ app.post('/api/ocr', async (req, res) => {
     );
     fs.writeFileSync(inputPath, data);
 
-    // OCR (cancellable)
-    const ocrProcess = execFile('ocrmypdf', ['--skip-text', '--rotate-pages', inputPath, outputPath]);
+    // OCR (cancellable, memory-efficient, 10-min timeout)
+    const ocrProcess = execFile('ocrmypdf', [
+      '--skip-text',
+      '--rotate-pages',
+      '--jobs', '1',          // single-threaded to limit memory use
+      '--output-type', 'pdf', // skip PDF/A conversion (less memory)
+      '--fast-web-view', '0', // skip linearization
+      inputPath,
+      outputPath
+    ]);
     if (request_id) activeProcesses.set(request_id, ocrProcess);
+
+    // Kill if it runs longer than 10 minutes
+    const timeout = setTimeout(() => {
+      ocrProcess.kill('SIGTERM');
+    }, 10 * 60 * 1000);
 
     await new Promise((resolve, reject) => {
       ocrProcess.on('close', (code) => {
+        clearTimeout(timeout);
         if (request_id) activeProcesses.delete(request_id);
         if (code === 0) resolve();
+        else if (code === null) reject(Object.assign(new Error('OCR timed out or was cancelled'), { killed: true }));
         else reject(new Error(`ocrmypdf exited with code ${code}`));
       });
       ocrProcess.on('error', (err) => {
+        clearTimeout(timeout);
         if (request_id) activeProcesses.delete(request_id);
         reject(err);
       });
