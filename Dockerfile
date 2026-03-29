@@ -8,6 +8,7 @@ RUN apt-get update && apt-get install -y \
     python3-venv \
     ghostscript \
     unpaper \
+    qpdf \
     && rm -rf /var/lib/apt/lists/*
 
 # Install ocrmypdf into a virtual env to avoid system pip restrictions
