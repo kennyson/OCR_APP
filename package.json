@@ -4,7 +4,8 @@
   "description": "Box Web App Integration for PDF OCR using Box AI",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
+    "ocr": "node ocr.js"
   },
   "dependencies": {
     "axios": "^1.7.2",
