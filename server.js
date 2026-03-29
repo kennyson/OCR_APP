@@ -489,80 +489,205 @@ function renderApp(fileId, fileName, accessToken) {
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Box PDF OCR</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=Lato:wght@400;700&display=swap" rel="stylesheet">
   <style>
+    :root {
+      --blue:        #0061d5;
+      --blue-dark:   #004db3;
+      --blue-light:  #e8f2ff;
+      --green:       #26c281;
+      --green-bg:    #e9f8f1;
+      --green-text:  #1a6840;
+      --red:         #e53935;
+      --red-bg:      #fdecea;
+      --red-text:    #b71c1c;
+      --orange-bg:   #fff8e1;
+      --orange-text: #e65100;
+      --bg:          #f4f4f4;
+      --surface:     #fff;
+      --border:      #e8e8e8;
+      --text:        #222;
+      --muted:       #767676;
+      --radius:      4px;
+    }
     * { box-sizing: border-box; margin: 0; padding: 0; }
-    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #f5f5f5; color: #333; padding: 20px; }
-    h1 { font-size: 18px; font-weight: 700; color: #0061d5; margin-bottom: 4px; }
-    .tabs { display: flex; gap: 0; margin-bottom: 20px; border-bottom: 2px solid #e0e0e0; }
-    .tab { background: none; border: none; padding: 10px 18px; font-size: 14px; font-weight: 500; color: #666; cursor: pointer; border-bottom: 2px solid transparent; margin-bottom: -2px; }
-    .tab.active { color: #0061d5; border-bottom-color: #0061d5; }
-    .tab:hover:not(.active) { color: #333; }
-    .panel { display: none; }
+    body {
+      font-family: Lato, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      font-size: 14px;
+      background: var(--bg);
+      color: var(--text);
+      min-height: 100vh;
+    }
+
+    /* ── Header ───────────────────────────────────── */
+    .hdr {
+      background: var(--blue);
+      padding: 0 20px;
+      height: 48px;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+    .hdr-icon { color: rgba(255,255,255,0.85); flex-shrink: 0; }
+    .hdr-title { color: #fff; font-size: 15px; font-weight: 700; letter-spacing: .2px; }
+    .hdr-file  { color: rgba(255,255,255,0.65); font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; }
+
+    /* ── Tabs ─────────────────────────────────────── */
+    .tabs { display: flex; background: var(--surface); border-bottom: 1px solid var(--border); padding: 0 20px; }
+    .tab {
+      background: none; border: none; border-bottom: 2px solid transparent;
+      padding: 12px 16px; margin-bottom: -1px;
+      font-family: inherit; font-size: 13px; font-weight: 700;
+      color: var(--muted); cursor: pointer;
+    }
+    .tab.active { color: var(--blue); border-bottom-color: var(--blue); }
+    .tab:hover:not(.active) { color: var(--text); }
+
+    /* ── Panels ───────────────────────────────────── */
+    .panel { display: none; padding: 20px; }
     .panel.active { display: block; }
-    .actions { display: flex; gap: 10px; margin-bottom: 20px; flex-wrap: wrap; }
-    button { background: #0061d5; color: #fff; border: none; border-radius: 6px; padding: 10px 18px; font-size: 14px; cursor: pointer; font-weight: 500; }
-    button:hover { background: #004fad; }
-    button:disabled { background: #999; cursor: default; }
-    button.secondary { background: #fff; color: #0061d5; border: 1px solid #0061d5; }
-    button.secondary:hover { background: #e8f0fe; }
-    button.secondary:disabled { background: #eee; color: #999; border-color: #ccc; }
-    button.danger { background: #c00; }
-    button.danger:hover { background: #a00; }
-    button.sm { padding: 5px 12px; font-size: 12px; }
-    #log { background: #fff; border-radius: 8px; box-shadow: 0 1px 3px rgba(0,0,0,0.08); padding: 16px; max-height: 360px; overflow-y: auto; }
-    .entry { padding: 6px 0; border-bottom: 1px solid #f0f0f0; font-size: 13px; display: flex; align-items: center; gap: 8px; }
-    .entry:last-child { border-bottom: none; }
-    .entry .name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-    .spinner { width: 14px; height: 14px; border: 2px solid #ddd; border-top-color: #0061d5; border-radius: 50%; animation: spin 0.6s linear infinite; flex-shrink: 0; }
+
+    /* ── Buttons ──────────────────────────────────── */
+    .btn {
+      display: inline-flex; align-items: center; gap: 6px;
+      height: 32px; padding: 0 16px;
+      border: 1px solid transparent; border-radius: var(--radius);
+      font-family: inherit; font-size: 13px; font-weight: 700;
+      cursor: pointer; white-space: nowrap;
+      transition: background .12s, border-color .12s;
+    }
+    .btn-primary { background: var(--blue); color: #fff; border-color: var(--blue); }
+    .btn-primary:hover:not(:disabled) { background: var(--blue-dark); border-color: var(--blue-dark); }
+    .btn-primary:disabled { background: #bcbcbc; border-color: #bcbcbc; cursor: default; }
+    .btn-secondary { background: var(--surface); color: var(--blue); border-color: var(--blue); }
+    .btn-secondary:hover:not(:disabled) { background: var(--blue-light); }
+    .btn-secondary:disabled { color: #bcbcbc; border-color: #bcbcbc; cursor: default; }
+    .btn-danger { background: var(--red); color: #fff; border-color: var(--red); }
+    .btn-danger:hover { background: #c62828; border-color: #c62828; }
+    .btn-sm { height: 28px; padding: 0 12px; font-size: 12px; }
+
+    /* ── Action row ───────────────────────────────── */
+    .actions { display: flex; align-items: center; gap: 8px; margin-bottom: 16px; flex-wrap: wrap; }
+    .hint { font-size: 12px; color: var(--muted); font-style: italic; margin-left: 4px; }
+
+    /* ── File list ────────────────────────────────── */
+    .file-list {
+      border: 1px solid var(--border); border-radius: var(--radius);
+      background: var(--surface); overflow: hidden;
+      max-height: 340px; overflow-y: auto;
+    }
+    .file-row {
+      display: flex; align-items: center; gap: 10px;
+      padding: 9px 14px; border-bottom: 1px solid var(--border);
+      font-size: 13px;
+    }
+    .file-row:last-child { border-bottom: none; }
+    .file-pdf {
+      flex-shrink: 0; width: 28px; height: 34px;
+      background: #e53935; border-radius: 2px;
+      display: flex; align-items: flex-end; justify-content: center;
+      padding-bottom: 4px; position: relative;
+    }
+    .file-pdf::before {
+      content: ''; position: absolute; top: 0; right: 0;
+      width: 0; height: 0;
+      border-style: solid; border-width: 0 7px 7px 0;
+      border-color: transparent var(--bg) transparent transparent;
+    }
+    .file-pdf span { color: #fff; font-size: 8px; font-weight: 700; letter-spacing: .5px; }
+    .file-name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13px; }
+    .file-meta { flex-shrink: 0; font-size: 12px; color: var(--muted); display: flex; align-items: center; gap: 6px; }
+    .file-meta.processing { color: var(--blue); font-weight: 700; }
+    .file-meta.done { color: var(--green-text); font-weight: 700; }
+    .file-meta.fail { color: var(--red-text); font-weight: 700; }
+    .file-meta.cancelled { color: var(--muted); font-style: italic; }
+
+    /* ── Spinner ──────────────────────────────────── */
+    .spinner {
+      width: 13px; height: 13px;
+      border: 2px solid #ddd; border-top-color: var(--blue);
+      border-radius: 50%; animation: spin .65s linear infinite; flex-shrink: 0;
+    }
     @keyframes spin { to { transform: rotate(360deg); } }
-    .done { color: #2e7d32; font-weight: 600; flex-shrink: 0; }
-    .fail { color: #c00; font-weight: 600; flex-shrink: 0; }
-    .cancelled { color: #666; font-style: italic; flex-shrink: 0; }
-    .summary { margin-top: 16px; padding: 12px 16px; border-radius: 6px; font-size: 14px; font-weight: 500; }
-    .summary.ok { background: #e8f5e9; color: #2e7d32; }
-    .summary.err { background: #fce4ec; color: #c00; }
-    .summary.warn { background: #fff8e1; color: #f57c00; }
-    .folder-row { display: flex; align-items: center; gap: 10px; padding: 10px 14px; background: #fff; border-radius: 8px; box-shadow: 0 1px 3px rgba(0,0,0,0.08); margin-bottom: 10px; font-size: 14px; }
-    .folder-row .name { flex: 1; font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-    .badge { font-size: 11px; font-weight: 600; padding: 3px 8px; border-radius: 10px; }
-    .badge.on { background: #e8f5e9; color: #2e7d32; }
-    .badge.off { background: #f5f5f5; color: #999; }
-    .info { font-size: 13px; color: #666; margin-bottom: 16px; line-height: 1.5; }
-    .section-title { font-size: 13px; font-weight: 600; color: #666; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 10px; }
-    .empty { color: #999; font-size: 13px; font-style: italic; padding: 12px 0; }
+
+    /* ── Result banner ────────────────────────────── */
+    .banner { margin-top: 12px; padding: 10px 14px; border-radius: var(--radius); font-size: 13px; font-weight: 700; display: flex; align-items: center; gap: 8px; }
+    .banner.ok   { background: var(--green-bg);  color: var(--green-text); }
+    .banner.err  { background: var(--red-bg);    color: var(--red-text);   }
+    .banner.warn { background: var(--orange-bg); color: var(--orange-text);}
+
+    /* ── Auto-OCR tab ─────────────────────────────── */
+    .info { font-size: 13px; color: var(--muted); margin-bottom: 16px; line-height: 1.6; }
+    .section-lbl {
+      font-size: 11px; font-weight: 700; text-transform: uppercase;
+      letter-spacing: .7px; color: var(--muted); margin-bottom: 8px;
+    }
+    .section-lbl + * { }
+    .folder-card {
+      display: flex; align-items: center; gap: 12px;
+      padding: 11px 14px;
+      background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius);
+      margin-bottom: 8px; font-size: 13px;
+    }
+    .folder-icon { flex-shrink: 0; color: #f5a623; }
+    .folder-name { flex: 1; font-weight: 700; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .badge { font-size: 11px; font-weight: 700; padding: 2px 8px; border-radius: 10px; flex-shrink: 0; }
+    .badge.on  { background: var(--green-bg);  color: var(--green-text); }
+    .badge.off { background: var(--bg);        color: var(--muted); }
+    .empty-state { color: var(--muted); font-size: 13px; padding: 24px 0; text-align: center; }
   </style>
 </head>
 <body>
-  <h1>Box PDF OCR</h1>
 
-  <div class="tabs">
-    <button class="tab active" onclick="switchTab('ocr', this)">OCR</button>
-    <button class="tab" onclick="switchTab('auto', this)">Auto-OCR</button>
+  <!-- Header -->
+  <div class="hdr">
+    <svg class="hdr-icon" width="20" height="20" viewBox="0 0 20 20" fill="none">
+      <rect x="2" y="4" width="10" height="13" rx="1" fill="rgba(255,255,255,0.9)"/>
+      <rect x="8" y="3" width="8" height="11" rx="1" fill="rgba(255,255,255,0.55)"/>
+      <text x="4" y="14" font-family="Lato,sans-serif" font-size="4" font-weight="700" fill="#e53935" letter-spacing=".3">PDF</text>
+      <path d="M11 3l5 4h-5V3z" fill="rgba(255,255,255,0.35)"/>
+    </svg>
+    <span class="hdr-title">PDF OCR</span>
+    <span class="hdr-file">${escHtml(fileName)}</span>
   </div>
 
-  <!-- OCR Tab -->
+  <!-- Tabs -->
+  <div class="tabs">
+    <button class="tab active" onclick="switchTab('ocr',this)">OCR</button>
+    <button class="tab" onclick="switchTab('auto',this)">Auto-OCR</button>
+  </div>
+
+  <!-- OCR Panel -->
   <div id="panel-ocr" class="panel active">
     <div class="actions">
-      <button id="btn-file" onclick="ocrSingleFile()">OCR this file</button>
-      <button id="btn-folder" class="secondary" onclick="ocrFolder()">OCR all PDFs in folder</button>
-      <button id="btn-cancel" class="danger" onclick="cancelOcr()" style="display:none;">Cancel</button>
+      <button class="btn btn-primary" id="btn-file" onclick="ocrSingleFile()">
+        <svg width="14" height="14" viewBox="0 0 14 14" fill="none"><path d="M7 1v8M3 5l4 4 4-4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/><path d="M1 11h12" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>
+        OCR this file
+      </button>
+      <button class="btn btn-secondary" id="btn-folder" onclick="ocrFolder()">
+        <svg width="14" height="14" viewBox="0 0 14 14" fill="none"><path d="M1 3.5A1.5 1.5 0 012.5 2H5l1.5 2H12a1.5 1.5 0 011.5 1.5v5A1.5 1.5 0 0112 12H2.5A1.5 1.5 0 011 10.5v-7z" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"/></svg>
+        OCR all in folder
+      </button>
+      <button class="btn btn-danger" id="btn-cancel" onclick="cancelOcr()" style="display:none;">
+        <svg width="12" height="12" viewBox="0 0 12 12" fill="none"><path d="M2 2l8 8M10 2l-8 8" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>
+        Cancel
+      </button>
+      <span id="hint" class="hint"></span>
     </div>
-    <div id="log"></div>
-    <p id="hint" style="font-size:12px;color:#666;font-style:italic;margin-top:8px;"></p>
+    <div class="file-list" id="log" style="display:none;"></div>
     <div id="summary"></div>
   </div>
 
-  <!-- Auto-OCR Tab -->
+  <!-- Auto-OCR Panel -->
   <div id="panel-auto" class="panel">
-    <p class="info">Auto-OCR watches a folder and automatically makes new PDFs searchable when they are uploaded — no manual steps needed.</p>
-
-    <div class="section-title">This folder</div>
+    <p class="info">Watched folders are automatically OCR'd when new PDFs are uploaded — no manual steps needed.</p>
+    <div class="section-lbl">This folder</div>
     <div id="current-folder-row">
-      <div class="folder-row"><span class="name">Loading…</span></div>
+      <div class="folder-card"><div class="spinner"></div><span class="folder-name" style="color:var(--muted)">Loading…</span></div>
     </div>
-
-    <div class="section-title" style="margin-top:20px;">All watched folders</div>
-    <div id="watched-list"><div class="empty">Loading…</div></div>
+    <div class="section-lbl" style="margin-top:20px;">All watched folders</div>
+    <div id="watched-list"><div class="empty-state">Loading…</div></div>
   </div>
 
   <script>
@@ -585,37 +710,47 @@ function renderApp(fileId, fileName, accessToken) {
     let cancelled = false;
     let currentRequestId = null;
 
-    function showCancel(show) { document.getElementById('btn-cancel').style.display = show ? 'inline-block' : 'none'; }
+    function showCancel(show) { document.getElementById('btn-cancel').style.display = show ? 'inline-flex' : 'none'; }
     function disable(yes) {
       document.getElementById('btn-file').disabled   = yes;
       document.getElementById('btn-folder').disabled = yes;
     }
     function addEntry(id, name) {
+      log.style.display = '';
       const div = document.createElement('div');
-      div.className = 'entry';
+      div.className = 'file-row';
       div.id = 'entry-' + id;
-      div.innerHTML = '<div class="spinner"></div><span class="name">' + esc(name) + '</span><span class="status">processing...</span>';
+      div.innerHTML =
+        '<div class="file-pdf"><span>PDF</span></div>' +
+        '<span class="file-name">' + esc(name) + '</span>' +
+        '<span class="file-meta processing"><div class="spinner"></div>processing…</span>';
       log.appendChild(div);
       log.scrollTop = log.scrollHeight;
     }
     function updateEntry(id, ok, msg) {
       const el = document.getElementById('entry-' + id);
       if (!el) return;
-      el.querySelector('.spinner')?.remove();
-      const status = el.querySelector('.status');
-      status.className = ok === null ? 'cancelled' : ok ? 'done' : 'fail';
-      status.textContent = ok === null ? 'cancelled' : ok ? 'done' : msg || 'failed';
+      const meta = el.querySelector('.file-meta');
+      meta.querySelector('.spinner')?.remove();
+      if (ok === null) {
+        meta.className = 'file-meta cancelled';
+        meta.textContent = '— cancelled';
+      } else if (ok) {
+        meta.className = 'file-meta done';
+        meta.innerHTML = '<svg width="13" height="13" viewBox="0 0 13 13" fill="none"><path d="M2 7l3.5 3.5L11 3" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg> done';
+      } else {
+        meta.className = 'file-meta fail';
+        meta.innerHTML = '<svg width="13" height="13" viewBox="0 0 13 13" fill="none"><path d="M2 2l9 9M11 2l-9 9" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg> ' + esc(msg || 'failed');
+      }
     }
     function showSummary(success, failed, cancelledCount) {
       if (cancelledCount > 0) {
-        summary.className = 'summary warn';
-        summary.textContent = success + ' done, ' + cancelledCount + ' cancelled' + (failed > 0 ? ', ' + failed + ' failed' : '') + '.';
+        summary.innerHTML = '<div class="banner warn">&#9888; ' + success + ' done, ' + cancelledCount + ' cancelled' + (failed > 0 ? ', ' + failed + ' failed' : '') + '.</div>';
       } else if (failed === 0) {
-        summary.className = 'summary ok';
-        summary.textContent = success === 1 ? 'File is now searchable in Box.' : success + ' files processed successfully.';
+        summary.innerHTML = '<div class="banner ok"><svg width="14" height="14" viewBox="0 0 14 14" fill="none"><path d="M2 7.5l4 4L12 3" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>' +
+          (success === 1 ? 'File is now searchable in Box.' : success + ' files processed successfully.') + '</div>';
       } else {
-        summary.className = 'summary err';
-        summary.textContent = success + ' succeeded, ' + failed + ' failed.';
+        summary.innerHTML = '<div class="banner err">&#10005; ' + success + ' succeeded, ' + failed + ' failed.</div>';
       }
     }
 
@@ -689,8 +824,7 @@ function renderApp(fileId, fileName, accessToken) {
         const { pdfs, folder_name, error } = await res.json();
         if (error) throw new Error(error);
         if (!pdfs?.length) {
-          summary.className = 'summary ok';
-          summary.textContent = 'No PDFs found in "' + (folder_name || 'folder') + '".';
+          summary.innerHTML = '<div class="banner ok">No PDFs found in \u201c' + esc(folder_name || 'folder') + '\u201d.</div>';
           showCancel(false); disable(false); return;
         }
         let success = 0, failed = 0, cancelledCount = 0;
@@ -705,8 +839,7 @@ function renderApp(fileId, fileName, accessToken) {
         }
         showSummary(success, failed, cancelledCount);
       } catch (e) {
-        summary.className = 'summary err';
-        summary.textContent = 'Error: ' + e.message;
+        summary.innerHTML = '<div class="banner err">&#10005; Error: ' + esc(e.message) + '</div>';
       }
       document.getElementById('hint').textContent = '';
       showCancel(false); disable(false);
@@ -732,36 +865,38 @@ function renderApp(fileId, fileName, accessToken) {
         renderAutoOcr();
       } catch (e) {
         document.getElementById('current-folder-row').innerHTML =
-          '<div class="folder-row"><span class="name" style="color:#c00">Error loading folder info: ' + esc(e.message) + '</span></div>';
+          '<div class="folder-card"><span class="folder-name" style="color:var(--red)">Error: ' + esc(e.message) + '</span></div>';
       }
     }
 
+    const FOLDER_ICON = '<svg class="folder-icon" width="18" height="18" viewBox="0 0 18 18" fill="none"><path d="M1 4.5A2 2 0 013 2.5h3.5l2 2.5H16a2 2 0 012 2v7a2 2 0 01-2 2H3a2 2 0 01-2-2v-9z" fill="#f5a623" stroke="#e09000" stroke-width=".6"/></svg>';
+
     function renderAutoOcr() {
-      // Current folder row
       const isWatching = currentFolderId && watchedFolders[currentFolderId];
       document.getElementById('current-folder-row').innerHTML = currentFolderId ? \`
-        <div class="folder-row">
-          <span class="name">\${esc(currentFolderName || currentFolderId)}</span>
-          <span class="badge \${isWatching ? 'on' : 'off'}">\${isWatching ? 'Watching' : 'Not watching'}</span>
+        <div class="folder-card">
+          \${FOLDER_ICON}
+          <span class="folder-name">\${esc(currentFolderName || currentFolderId)}</span>
+          <span class="badge \${isWatching ? 'on' : 'off'}">\${isWatching ? 'Watching' : 'Off'}</span>
           \${isWatching
-            ? '<button class="secondary sm" onclick="unwatchFolder(' + JSON.stringify(currentFolderId) + ')">Stop</button>'
-            : '<button class="sm" onclick="watchCurrentFolder()">Watch</button>'
+            ? '<button class="btn btn-secondary btn-sm" onclick="unwatchFolder(' + JSON.stringify(currentFolderId) + ')">Stop</button>'
+            : '<button class="btn btn-primary btn-sm" onclick="watchCurrentFolder()">Watch</button>'
           }
         </div>
-      \` : '<div class="folder-row"><span class="name" style="color:#999">Could not determine folder</span></div>';
+      \` : '<div class="folder-card"><span class="folder-name" style="color:var(--muted)">Could not determine folder</span></div>';
 
-      // All watched folders
       const entries = Object.entries(watchedFolders);
       const listEl  = document.getElementById('watched-list');
       if (entries.length === 0) {
-        listEl.innerHTML = '<div class="empty">No folders are being watched yet.</div>';
+        listEl.innerHTML = '<div class="empty-state">No folders are being watched yet.</div>';
         return;
       }
       listEl.innerHTML = entries.map(([fid, info]) => \`
-        <div class="folder-row">
-          <span class="name">\${esc(info.folderName || fid)}</span>
+        <div class="folder-card">
+          \${FOLDER_ICON}
+          <span class="folder-name">\${esc(info.folderName || fid)}</span>
           <span class="badge on">Watching</span>
-          <button class="secondary sm" onclick="unwatchFolder(\${JSON.stringify(fid)})">Stop</button>
+          <button class="btn btn-secondary btn-sm" onclick="unwatchFolder(\${JSON.stringify(fid)})">Stop</button>
         </div>
       \`).join('');
     }
@@ -781,7 +916,7 @@ function renderApp(fileId, fileName, accessToken) {
         renderAutoOcr();
       } catch (e) {
         document.getElementById('current-folder-row').innerHTML =
-          '<div class="folder-row"><span class="name" style="color:#c00">Error: ' + esc(e.message) + '</span></div>';
+          '<div class="folder-card"><span class="folder-name" style="color:var(--red)">Error: ' + esc(e.message) + '</span></div>';
       }
     }
 
@@ -803,7 +938,7 @@ function renderApp(fileId, fileName, accessToken) {
 
     function setFolderRowLoading() {
       document.getElementById('current-folder-row').innerHTML =
-        '<div class="folder-row"><div class="spinner"></div><span class="name">Enabling auto-OCR…</span></div>';
+        '<div class="folder-card"><div class="spinner"></div><span class="folder-name" style="color:var(--muted)">Enabling auto-OCR…</span></div>';
     }
 
     function esc(s) { const d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
