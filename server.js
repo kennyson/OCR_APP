@@ -5,6 +5,7 @@ const FormData = require('form-data');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
+const crypto = require('crypto');
 const { execFile } = require('child_process');
 const { promisify } = require('util');
 
@@ -20,90 +21,88 @@ if (!CLIENT_ID || !CLIENT_SECRET || !BASE_URL) {
   process.exit(1);
 }
 
+// Short-lived in-memory job store (file_id + token, expires in 10 minutes)
+const jobs = new Map();
+function createJob(fileId, token) {
+  const id = crypto.randomBytes(16).toString('hex');
+  jobs.set(id, { fileId, token });
+  setTimeout(() => jobs.delete(id), 10 * 60 * 1000);
+  return id;
+}
+
 app.use(express.json());
+app.use(express.urlencoded({ extended: false }));
 app.use((req, res, next) => {
-  console.log(`${req.method} ${req.url}`);
+  console.log(`${req.method} ${req.url}`, req.body || '');
   next();
 });
 app.use(express.static(path.join(__dirname, 'public')));
 
-// ── OAuth flow ──────────────────────────────────────────────────────────────
+// ── Box server-side callback ─────────────────────────────────────────────────
+// Box POSTs here with file info before redirecting the browser.
+// Configure this as the "Server Callback URL" in Box Developer Console.
+app.post('/box-callback', async (req, res) => {
+  console.log('Box server callback body:', req.body);
+  const { typedID, authCode } = req.body;
 
-// Box Web App Integration entry point
-// Execute URL: https://domain/ocr?file_id={file_id}&file_name={file_name}
-app.get('/ocr', (req, res) => {
-  const { file_id, file_name } = req.query;
-  if (!file_id) return res.status(400).send('Missing file_id');
-
-  // Encode file context in the OAuth state parameter — no session needed
-  const state = Buffer.from(JSON.stringify({
-    file_id,
-    file_name: file_name || 'document.pdf'
-  })).toString('base64url');
-
-  const authUrl = 'https://account.box.com/api/oauth2/authorize?' +
-    `client_id=${CLIENT_ID}` +
-    `&response_type=code` +
-    `&redirect_uri=${encodeURIComponent(BASE_URL + '/callback')}` +
-    `&state=${state}`;
-
-  res.redirect(authUrl);
-});
-
-// OAuth callback — exchange code for token, render the app
-app.get('/callback', async (req, res) => {
-  const { code, state } = req.query;
-
-  if (!code || !state) {
-    return res.status(400).send(renderError('OAuth Error', 'Missing code or state parameter.'));
+  if (!typedID || !authCode) {
+    return res.status(400).json({ error: 'Missing typedID or authCode' });
   }
 
-  let stateData;
-  try {
-    stateData = JSON.parse(Buffer.from(state, 'base64url').toString());
-  } catch {
-    return res.status(400).send(renderError('OAuth Error', 'Invalid state parameter.'));
-  }
+  // typedID format: "file_12345" or just "12345"
+  const fileId = typedID.replace(/^file_/, '');
 
   try {
-    const { data } = await axios.post(
+    // Exchange the one-time auth code for an access token
+    const { data: tokenData } = await axios.post(
       'https://api.box.com/oauth2/token',
       new URLSearchParams({
         grant_type: 'authorization_code',
-        code,
+        code: authCode,
         client_id: CLIENT_ID,
-        client_secret: CLIENT_SECRET,
-        redirect_uri: BASE_URL + '/callback'
+        client_secret: CLIENT_SECRET
       }),
       { headers: { 'Content-Type': 'application/x-www-form-urlencoded' } }
     );
 
-    const accessToken = data.access_token;
-    let fileName = stateData.file_name;
+    const jobId = createJob(fileId, tokenData.access_token);
 
-    // If Box didn't substitute {file_name}, fetch it from the API
-    if (!fileName || fileName === '{file_name}') {
-      try {
-        const { data: fileInfo } = await axios.get(
-          `https://api.box.com/2.0/files/${stateData.file_id}?fields=name`,
-          { headers: { Authorization: `Bearer ${accessToken}` } }
-        );
-        fileName = fileInfo.name;
-      } catch {
-        fileName = 'document.pdf';
-      }
-    }
-
-    res.send(renderApp(stateData.file_id, fileName, accessToken));
+    // Tell Box where to send the user's browser
+    res.json({ client_callback_url: `${BASE_URL}/ocr-ui?job=${jobId}` });
   } catch (err) {
-    const msg = err.response?.data?.error_description || err.message;
-    res.status(500).send(renderError('OAuth Failed', msg));
+    console.error('Token exchange error:', err.response?.data || err.message);
+    res.status(500).json({ error: 'Authentication failed' });
   }
 });
 
-// ── API routes (token passed from client) ───────────────────────────────────
+// ── Client UI ────────────────────────────────────────────────────────────────
+// Box redirects the user's browser here after the server callback.
+// Configure this as the "Client Callback URL" in Box Developer Console.
+app.get('/ocr-ui', async (req, res) => {
+  const job = jobs.get(req.query.job);
+  if (!job) {
+    return res.status(400).send(renderError(
+      'Session expired',
+      'Please re-open this integration from Box.'
+    ));
+  }
 
-// Get parent folder's PDFs
+  let fileName = 'document.pdf';
+  try {
+    const { data } = await axios.get(
+      `https://api.box.com/2.0/files/${job.fileId}?fields=name`,
+      { headers: { Authorization: `Bearer ${job.token}` } }
+    );
+    fileName = data.name;
+  } catch (err) {
+    console.error('Failed to get file name:', err.message);
+  }
+
+  res.send(renderApp(job.fileId, fileName, job.token));
+});
+
+// ── API routes ───────────────────────────────────────────────────────────────
+
 app.get('/api/folder-pdfs', async (req, res) => {
   const { file_id, access_token } = req.query;
   if (!access_token) return res.status(401).json({ error: 'Not authenticated' });
@@ -121,12 +120,10 @@ app.get('/api/folder-pdfs', async (req, res) => {
     do {
       const params = { fields: 'id,name', limit: 1000 };
       if (marker) params.marker = marker;
-
       const { data } = await axios.get(
         `https://api.box.com/2.0/folders/${folderId}/items`,
         { headers: { Authorization: `Bearer ${access_token}` }, params }
       );
-
       for (const item of data.entries) {
         if (item.type === 'file' && item.name.toLowerCase().endsWith('.pdf')) {
           pdfs.push({ id: item.id, name: item.name });
@@ -141,7 +138,6 @@ app.get('/api/folder-pdfs', async (req, res) => {
   }
 });
 
-// OCR a single file
 app.post('/api/ocr', async (req, res) => {
   const { file_id, file_name, access_token } = req.body;
   if (!access_token) return res.status(401).json({ error: 'Not authenticated' });
@@ -150,17 +146,14 @@ app.post('/api/ocr', async (req, res) => {
   const outputPath = path.join(os.tmpdir(), `box-ocr-out-${file_id}.pdf`);
 
   try {
-    // Download
     const { data } = await axios.get(
       `https://api.box.com/2.0/files/${file_id}/content`,
       { headers: { Authorization: `Bearer ${access_token}` }, responseType: 'arraybuffer' }
     );
     fs.writeFileSync(inputPath, data);
 
-    // OCR
     await execFileAsync('ocrmypdf', ['--skip-text', '--rotate-pages', inputPath, outputPath]);
 
-    // Upload new version
     const form = new FormData();
     form.append('attributes', JSON.stringify({ name: file_name }));
     form.append('file', fs.createReadStream(outputPath), {
@@ -176,15 +169,14 @@ app.post('/api/ocr', async (req, res) => {
 
     res.json({ success: true });
   } catch (err) {
-    const msg = err.response?.data?.message || err.message;
-    res.status(500).json({ error: msg });
+    res.status(500).json({ error: err.response?.data?.message || err.message });
   } finally {
     try { fs.unlinkSync(inputPath); } catch {}
     try { fs.unlinkSync(outputPath); } catch {}
   }
 });
 
-// ── HTML templates ───────────────────────────────────────────────────────────
+// ── HTML templates ────────────────────────────────────────────────────────────
 
 function renderApp(fileId, fileName, accessToken) {
   return `<!DOCTYPE html>
@@ -225,7 +217,6 @@ function renderApp(fileId, fileName, accessToken) {
   </div>
   <div id="log"></div>
   <div id="summary"></div>
-
   <script>
     const FILE_ID = ${JSON.stringify(fileId)};
     const FILE_NAME = ${JSON.stringify(fileName)};
@@ -237,7 +228,6 @@ function renderApp(fileId, fileName, accessToken) {
       document.getElementById('btn-file').disabled = yes;
       document.getElementById('btn-folder').disabled = yes;
     }
-
     function addEntry(id, name) {
       const div = document.createElement('div');
       div.className = 'entry';
@@ -246,84 +236,51 @@ function renderApp(fileId, fileName, accessToken) {
       log.appendChild(div);
       log.scrollTop = log.scrollHeight;
     }
-
     function updateEntry(id, ok, msg) {
       const el = document.getElementById('entry-' + id);
       if (!el) return;
-      const spinner = el.querySelector('.spinner');
+      el.querySelector('.spinner')?.remove();
       const status = el.querySelector('.status');
-      if (spinner) spinner.remove();
       status.className = ok ? 'done' : 'fail';
       status.textContent = ok ? 'done' : msg || 'failed';
     }
-
     function showSummary(success, failed) {
-      if (failed === 0) {
-        summary.className = 'summary ok';
-        summary.textContent = success === 1
-          ? 'File is now searchable in Box.'
-          : success + ' files processed successfully.';
-      } else {
-        summary.className = 'summary err';
-        summary.textContent = success + ' succeeded, ' + failed + ' failed.';
-      }
+      summary.className = failed === 0 ? 'summary ok' : 'summary err';
+      summary.textContent = failed === 0
+        ? (success === 1 ? 'File is now searchable in Box.' : success + ' files processed successfully.')
+        : success + ' succeeded, ' + failed + ' failed.';
     }
-
     async function ocrOne(fileId, fileName) {
       const res = await fetch('/api/ocr', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ file_id: fileId, file_name: fileName, access_token: TOKEN })
       });
-      if (!res.ok) {
-        const data = await res.json().catch(() => ({}));
-        throw new Error(data.error || 'Request failed');
-      }
+      if (!res.ok) throw new Error((await res.json().catch(() => ({}))).error || 'Failed');
     }
-
     async function ocrSingleFile() {
-      disable(true);
-      log.innerHTML = '';
-      summary.innerHTML = '';
+      disable(true); log.innerHTML = ''; summary.innerHTML = '';
       addEntry(FILE_ID, FILE_NAME);
-      try {
-        await ocrOne(FILE_ID, FILE_NAME);
-        updateEntry(FILE_ID, true);
-        showSummary(1, 0);
-      } catch (e) {
-        updateEntry(FILE_ID, false, e.message);
-        showSummary(0, 1);
-      }
+      try { await ocrOne(FILE_ID, FILE_NAME); updateEntry(FILE_ID, true); showSummary(1, 0); }
+      catch (e) { updateEntry(FILE_ID, false, e.message); showSummary(0, 1); }
       disable(false);
     }
-
     async function ocrFolder() {
-      disable(true);
-      log.innerHTML = '';
-      summary.innerHTML = '';
-
+      disable(true); log.innerHTML = ''; summary.innerHTML = '';
       try {
         const res = await fetch('/api/folder-pdfs?file_id=' + FILE_ID + '&access_token=' + encodeURIComponent(TOKEN));
         const { pdfs, folder_name, error } = await res.json();
         if (error) throw new Error(error);
-        if (!pdfs || pdfs.length === 0) {
+        if (!pdfs?.length) {
           summary.className = 'summary ok';
           summary.textContent = 'No PDFs found in "' + (folder_name || 'folder') + '".';
-          disable(false);
-          return;
+          disable(false); return;
         }
-
         let success = 0, failed = 0;
         for (const pdf of pdfs) {
           addEntry(pdf.id, pdf.name);
-          try {
-            await ocrOne(pdf.id, pdf.name);
-            updateEntry(pdf.id, true);
-            success++;
-          } catch (e) {
-            updateEntry(pdf.id, false, e.message);
-            failed++;
-          }
+          try { await ocrOne(pdf.id, pdf.name); updateEntry(pdf.id, true); success++; }
+          catch (e) { updateEntry(pdf.id, false, e.message); failed++; }
         }
         showSummary(success, failed);
       } catch (e) {
@@ -332,12 +289,7 @@ function renderApp(fileId, fileName, accessToken) {
       }
       disable(false);
     }
-
-    function esc(s) {
-      const d = document.createElement('div');
-      d.textContent = s;
-      return d.innerHTML;
-    }
+    function esc(s) { const d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
   </script>
 </body>
 </html>`;
@@ -347,8 +299,7 @@ function renderError(title, detail) {
   return `<!DOCTYPE html>
 <html lang="en">
 <head>
-  <meta charset="UTF-8">
-  <title>Error – Box OCR</title>
+  <meta charset="UTF-8"><title>Error</title>
   <style>
     * { box-sizing: border-box; margin: 0; padding: 0; }
     body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #f5f5f5; display: flex; align-items: center; justify-content: center; min-height: 100vh; }
@@ -370,6 +321,4 @@ function escHtml(str) {
   return String(str).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }
 
-app.listen(PORT, () => {
-  console.log(`Box PDF OCR server running at http://localhost:${PORT}`);
-});
+app.listen(PORT, () => console.log(`Box PDF OCR server running at http://localhost:${PORT}`));
