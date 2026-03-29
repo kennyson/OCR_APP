@@ -33,7 +33,10 @@ function createJob(fileId, token) {
 app.use(express.json());
 app.use(express.urlencoded({ extended: false }));
 app.use((req, res, next) => {
-  console.log(`${req.method} ${req.url}`, req.body || '');
+  console.log(`${req.method} ${req.url}`);
+  console.log('Query:', JSON.stringify(req.query));
+  console.log('Body:', JSON.stringify(req.body));
+  console.log('Content-Type:', req.headers['content-type']);
   next();
 });
 app.use(express.static(path.join(__dirname, 'public')));
@@ -42,8 +45,10 @@ app.use(express.static(path.join(__dirname, 'public')));
 // Box POSTs here when user triggers the integration.
 // Start OAuth flow with file context stored in the state parameter.
 app.post('/ocr-ui', (req, res) => {
-  console.log('Box POST to /ocr-ui:', req.body);
-  const { file_id, file_name } = req.body;
+  // Box may send params in body or query string
+  const file_id = req.body.file_id || req.query.file_id;
+  const file_name = req.body.file_name || req.query.file_name;
+  console.log('file_id:', file_id, 'file_name:', file_name);
   if (!file_id) return res.status(400).send(renderError('Missing file_id', 'No file ID was provided by Box.'));
 
   const state = Buffer.from(JSON.stringify({
