@@ -202,6 +202,8 @@ async function getFileName(fileId, token) {
 }
 
 // ── Box Integration entry point ──────────────────────────────────────────────
+// Serve a gateway page — client checks localStorage for stored token,
+// avoiding repeated OAuth caused by browsers blocking cross-site cookies.
 app.post('/ocr-ui', upload.none(), async (req, res) => {
   const file_id = req.body.file_id || req.query.file_id;
   const file_name = req.body.file_name || req.query.file_name;
@@ -211,36 +213,6 @@ app.post('/ocr-ui', upload.none(), async (req, res) => {
     return res.status(400).send(renderError('Missing file_id', 'No file ID was provided by Box.'));
   }
 
-  // Try stored refresh token first (skip OAuth)
-  const encCookie = req.cookies?.box_rt;
-  if (encCookie) {
-    try {
-      const oldRefresh = decrypt(encCookie);
-      const tokens = await refreshAccessToken(oldRefresh);
-      setRefreshCookie(res, tokens.refresh_token);
-      saveServiceToken(tokens.refresh_token); // keep service token fresh
-
-      const fileName = file_name || await getFileName(file_id, tokens.access_token);
-      return res.send(renderApp(file_id, fileName, tokens.access_token));
-    } catch (err) {
-      console.log('Refresh token expired, starting OAuth:', err.message);
-      res.clearCookie('box_rt');
-    }
-  }
-
-  // Fallback: try stored service token (fixes repeated Grant Access when browser blocks cookies)
-  try {
-    const stored = JSON.parse(fs.readFileSync(SERVICE_TOKEN_FILE, 'utf8'));
-    const tokens = await refreshAccessToken(stored.refreshToken);
-    saveServiceToken(tokens.refresh_token);
-    setRefreshCookie(res, tokens.refresh_token);
-    const fileName = file_name || await getFileName(file_id, tokens.access_token);
-    return res.send(renderApp(file_id, fileName, tokens.access_token));
-  } catch (e) {
-    console.log('Service token fallback failed, starting OAuth:', e.message);
-  }
-
-  // Fall through to OAuth
   const state = Buffer.from(JSON.stringify({
     file_id,
     file_name: file_name || 'document.pdf'
@@ -252,7 +224,27 @@ app.post('/ocr-ui', upload.none(), async (req, res) => {
     `&redirect_uri=${encodeURIComponent(BASE_URL + '/callback')}` +
     `&state=${state}`;
 
-  res.redirect(authUrl);
+  res.send(renderGateway(file_id, file_name || '', authUrl));
+});
+
+// ── API: silent token refresh using localStorage-stored encrypted token ────────
+app.post('/api/use-stored-token', async (req, res) => {
+  const { encrypted_refresh, file_id, file_name } = req.body;
+  if (!encrypted_refresh || !file_id) return res.status(400).json({ error: 'Missing params' });
+  try {
+    const refreshToken = decrypt(encrypted_refresh);
+    const tokens = await refreshAccessToken(refreshToken);
+    saveServiceToken(tokens.refresh_token);
+    const fileName = file_name || await getFileName(file_id, tokens.access_token);
+    const newEncRefresh = encrypt(tokens.refresh_token);
+    res.json({
+      enc_refresh: newEncRefresh,
+      html: renderApp(file_id, fileName, tokens.access_token, newEncRefresh)
+    });
+  } catch (err) {
+    console.log('Stored token refresh failed:', err.message);
+    res.status(401).json({ error: 'Token expired' });
+  }
 });
 
 // ── OAuth callback ────────────────────────────────────────────────────────────
@@ -280,8 +272,8 @@ app.get('/callback', async (req, res) => {
       { headers: { 'Content-Type': 'application/x-www-form-urlencoded' } }
     );
 
-    setRefreshCookie(res, data.refresh_token);
-    saveServiceToken(data.refresh_token); // save for automated webhook processing
+    saveServiceToken(data.refresh_token);
+    const encRefresh = encrypt(data.refresh_token);
 
     const accessToken = data.access_token;
     let fileName = stateData.file_name;
@@ -289,7 +281,7 @@ app.get('/callback', async (req, res) => {
       fileName = await getFileName(stateData.file_id, accessToken);
     }
 
-    res.send(renderApp(stateData.file_id, fileName, accessToken));
+    res.send(renderApp(stateData.file_id, fileName, accessToken, encRefresh));
   } catch (err) {
     const msg = err.response?.data?.error_description || err.message;
     res.status(500).send(renderError('OAuth Failed', msg));
@@ -499,7 +491,55 @@ app.post('/api/cancel', (req, res) => {
 
 // ── HTML ─────────────────────────────────────────────────────────────────────
 
-function renderApp(fileId, fileName, accessToken) {
+// Gateway: shown on every Box popup open. Checks localStorage for stored token
+// to skip OAuth. Falls back to OAuth only on first use or after token expiry.
+function renderGateway(fileId, fileName, authUrl) {
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Box PDF OCR</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=Lato:wght@400;700&display=swap" rel="stylesheet">
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: Lato, -apple-system, sans-serif; background: #f4f4f4; display: flex; flex-direction: column; align-items: center; justify-content: center; min-height: 100vh; gap: 14px; }
+    .spinner { width: 32px; height: 32px; border: 3px solid #e0e0e0; border-top-color: #0061d5; border-radius: 50%; animation: spin .7s linear infinite; }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    p { color: #767676; font-size: 14px; }
+  </style>
+</head>
+<body>
+  <div class="spinner"></div>
+  <p>Loading\u2026</p>
+  <script>
+    (async () => {
+      const stored = localStorage.getItem('box_ocr_rt');
+      if (stored) {
+        try {
+          const r = await fetch('/api/use-stored-token', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ encrypted_refresh: stored, file_id: ${JSON.stringify(fileId)}, file_name: ${JSON.stringify(fileName)} })
+          });
+          if (r.ok) {
+            const { enc_refresh, html } = await r.json();
+            localStorage.setItem('box_ocr_rt', enc_refresh);
+            document.open(); document.write(html); document.close();
+            return;
+          }
+          localStorage.removeItem('box_ocr_rt');
+        } catch (e) { localStorage.removeItem('box_ocr_rt'); }
+      }
+      window.location.href = ${JSON.stringify(authUrl)};
+    })();
+  </script>
+</body>
+</html>`;
+}
+
+function renderApp(fileId, fileName, accessToken, encRefresh = null) {
   return `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -708,6 +748,9 @@ function renderApp(fileId, fileName, accessToken) {
   </div>
 
   <script>
+    // Persist encrypted refresh token so future popup opens skip OAuth
+    (function(){ const r=${JSON.stringify(encRefresh)}; if(r) localStorage.setItem('box_ocr_rt',r); })();
+
     const FILE_ID   = ${JSON.stringify(fileId)};
     const FILE_NAME = ${JSON.stringify(fileName)};
     const TOKEN     = ${JSON.stringify(accessToken)};
