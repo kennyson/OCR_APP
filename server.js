@@ -46,6 +46,114 @@ function decrypt(data) {
 // ── In-flight OCR processes (for cancel support) ─────────────────────────────
 const activeProcesses = new Map(); // requestId → ChildProcess
 
+// ── Service token storage (for automated webhook OCR) ────────────────────────
+const SERVICE_TOKEN_FILE = path.join(os.tmpdir(), 'box-ocr-service-token.json');
+const WATCHED_FOLDERS_FILE = path.join(os.tmpdir(), 'box-ocr-watched-folders.json');
+
+function saveServiceToken(refreshToken) {
+  try {
+    fs.writeFileSync(SERVICE_TOKEN_FILE, JSON.stringify({ refreshToken }));
+  } catch (e) {
+    console.error('Failed to save service token:', e.message);
+  }
+}
+
+async function getServiceAccessToken() {
+  let stored;
+  try {
+    stored = JSON.parse(fs.readFileSync(SERVICE_TOKEN_FILE, 'utf8'));
+  } catch {
+    throw new Error('No service token. Open the OCR app in Box once to re-authenticate.');
+  }
+  const tokens = await refreshAccessToken(stored.refreshToken);
+  saveServiceToken(tokens.refresh_token);
+  return tokens.access_token;
+}
+
+function loadWatchedFolders() {
+  try { return JSON.parse(fs.readFileSync(WATCHED_FOLDERS_FILE, 'utf8')); }
+  catch { return {}; }
+}
+
+function saveWatchedFolders(data) {
+  fs.writeFileSync(WATCHED_FOLDERS_FILE, JSON.stringify(data));
+}
+
+// ── Webhook signature validation ──────────────────────────────────────────────
+function validateWebhookSignature(rawBody, timestamp, sigPrimary, sigSecondary) {
+  const primaryKey = process.env.BOX_WEBHOOK_PRIMARY_KEY;
+  const secondaryKey = process.env.BOX_WEBHOOK_SECONDARY_KEY;
+  if (!primaryKey && !secondaryKey) return true; // no keys configured, skip
+
+  function computeSig(key) {
+    return crypto.createHmac('sha256', key).update(timestamp + rawBody).digest('base64');
+  }
+
+  const validPrimary = primaryKey && sigPrimary === computeSig(primaryKey);
+  const validSecondary = secondaryKey && sigSecondary === computeSig(secondaryKey);
+  return validPrimary || validSecondary;
+}
+
+// ── Box webhook receiver (raw body needed for signature — defined FIRST) ──────
+app.post('/webhook', express.raw({ type: '*/*' }), async (req, res) => {
+  const timestamp  = req.headers['box-delivery-timestamp'] || '';
+  const sigPrimary = req.headers['box-signature-primary']  || '';
+  const sigSecondary = req.headers['box-signature-secondary'] || '';
+  const rawBody = req.body.toString('utf8');
+
+  if (!validateWebhookSignature(rawBody, timestamp, sigPrimary, sigSecondary)) {
+    console.log('Webhook: invalid signature — rejecting');
+    return res.status(401).send('Invalid signature');
+  }
+
+  let event;
+  try { event = JSON.parse(rawBody); }
+  catch { return res.status(400).send('Invalid JSON'); }
+
+  if (event.trigger !== 'FILE.UPLOADED') return res.json({ ok: true, skipped: 'not FILE.UPLOADED' });
+
+  const file = event.source;
+  if (!file || file.type !== 'file' || !file.name?.toLowerCase().endsWith('.pdf')) {
+    return res.json({ ok: true, skipped: 'not a PDF' });
+  }
+
+  console.log(`Webhook: auto-OCR queued for "${file.name}" (${file.id})`);
+  res.json({ ok: true }); // respond immediately; Box expects fast ack
+
+  setImmediate(async () => {
+    const inputPath  = path.join(os.tmpdir(), `box-auto-in-${file.id}.pdf`);
+    const outputPath = path.join(os.tmpdir(), `box-auto-out-${file.id}.pdf`);
+    try {
+      const accessToken = await getServiceAccessToken();
+      const { data } = await axios.get(
+        `https://api.box.com/2.0/files/${file.id}/content`,
+        { headers: { Authorization: `Bearer ${accessToken}` }, responseType: 'arraybuffer' }
+      );
+      fs.writeFileSync(inputPath, data);
+      await ocrByPage(inputPath, outputPath, null);
+
+      const form = new FormData();
+      form.append('attributes', JSON.stringify({ name: file.name }));
+      form.append('file', fs.createReadStream(outputPath), {
+        filename: file.name, contentType: 'application/pdf'
+      });
+      const uploadToken = await getServiceAccessToken();
+      await axios.post(
+        `https://upload.box.com/api/2.0/files/${file.id}/content`,
+        form,
+        { headers: { Authorization: `Bearer ${uploadToken}`, ...form.getHeaders() } }
+      );
+      console.log(`Auto-OCR complete: "${file.name}"`);
+    } catch (err) {
+      console.error(`Auto-OCR failed for "${file.name}":`, err.message);
+    } finally {
+      try { fs.unlinkSync(inputPath); } catch {}
+      try { fs.unlinkSync(outputPath); } catch {}
+    }
+  });
+});
+
+// ── Global middleware ─────────────────────────────────────────────────────────
 app.use(express.json());
 app.use(express.urlencoded({ extended: false }));
 app.use(cookieParser());
@@ -102,6 +210,7 @@ app.post('/ocr-ui', upload.none(), async (req, res) => {
       const oldRefresh = decrypt(encCookie);
       const tokens = await refreshAccessToken(oldRefresh);
       setRefreshCookie(res, tokens.refresh_token);
+      saveServiceToken(tokens.refresh_token); // keep service token fresh
 
       const fileName = file_name || await getFileName(file_id, tokens.access_token);
       return res.send(renderApp(file_id, fileName, tokens.access_token));
@@ -151,8 +260,8 @@ app.get('/callback', async (req, res) => {
       { headers: { 'Content-Type': 'application/x-www-form-urlencoded' } }
     );
 
-    // Store refresh token in encrypted cookie
     setRefreshCookie(res, data.refresh_token);
+    saveServiceToken(data.refresh_token); // save for automated webhook processing
 
     const accessToken = data.access_token;
     let fileName = stateData.file_name;
@@ -196,7 +305,65 @@ app.get('/api/folder-pdfs', async (req, res) => {
       marker = data.next_marker || null;
     } while (marker);
 
-    res.json({ folder_name: fileInfo.parent.name, pdfs });
+    res.json({ folder_id: folderId, folder_name: fileInfo.parent.name, pdfs });
+  } catch (err) {
+    res.status(500).json({ error: err.response?.data?.message || err.message });
+  }
+});
+
+// ── API: watched folders ──────────────────────────────────────────────────────
+app.get('/api/watched-folders', (req, res) => {
+  res.json(loadWatchedFolders());
+});
+
+app.post('/api/watch-folder', async (req, res) => {
+  const { folder_id, folder_name, access_token } = req.body;
+  if (!access_token) return res.status(401).json({ error: 'Not authenticated' });
+
+  try {
+    const watched = loadWatchedFolders();
+    if (watched[folder_id]) return res.json({ ok: true, alreadyWatching: true });
+
+    const { data } = await axios.post(
+      'https://api.box.com/2.0/webhooks',
+      {
+        target: { id: folder_id, type: 'folder' },
+        address: BASE_URL + '/webhook',
+        triggers: ['FILE.UPLOADED']
+      },
+      { headers: { Authorization: `Bearer ${access_token}`, 'Content-Type': 'application/json' } }
+    );
+
+    watched[folder_id] = { webhookId: data.id, folderName: folder_name };
+    saveWatchedFolders(watched);
+    res.json({ ok: true, webhookId: data.id });
+  } catch (err) {
+    res.status(500).json({ error: err.response?.data?.message || err.message });
+  }
+});
+
+app.post('/api/unwatch-folder', async (req, res) => {
+  const { folder_id, access_token } = req.body;
+  if (!access_token) return res.status(401).json({ error: 'Not authenticated' });
+
+  try {
+    const watched = loadWatchedFolders();
+    const entry = watched[folder_id];
+    if (!entry) return res.json({ ok: true, notWatching: true });
+
+    try {
+      await axios.delete(
+        `https://api.box.com/2.0/webhooks/${entry.webhookId}`,
+        { headers: { Authorization: `Bearer ${access_token}` } }
+      );
+    } catch (e) {
+      // Webhook may have already been removed; continue
+      console.log('Webhook delete warning:', e.response?.data?.message || e.message);
+    }
+
+    delete watched[folder_id];
+    saveWatchedFolders(watched);
+    res.json({ ok: true });
   } catch (err) {
     res.status(500).json({ error: err.response?.data?.message || err.message });
   }
@@ -206,7 +373,6 @@ app.get('/api/folder-pdfs', async (req, res) => {
 async function ocrByPage(inputPath, outputPath, requestId) {
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'box-ocr-pages-'));
   try {
-    // Get page count
     const { stdout } = await execFileAsync('qpdf', ['--show-npages', inputPath]);
     const pageCount = parseInt(stdout.trim(), 10);
     console.log(`OCR: splitting ${pageCount} pages`);
@@ -217,10 +383,8 @@ async function ocrByPage(inputPath, outputPath, requestId) {
       const pageIn  = path.join(tmpDir, `page-${i}-in.pdf`);
       const pageOut = path.join(tmpDir, `page-${i}-out.pdf`);
 
-      // Extract single page
       await execFileAsync('qpdf', ['--empty', '--pages', inputPath, String(i), '--', pageIn]);
 
-      // OCR the page
       const proc = execFile('ocrmypdf', [
         '--skip-text', '--jobs', '1', '--output-type', 'pdf', '--fast-web-view', '0',
         pageIn, pageOut
@@ -230,7 +394,7 @@ async function ocrByPage(inputPath, outputPath, requestId) {
       await new Promise((resolve, reject) => {
         proc.on('close', code => {
           if (requestId) activeProcesses.delete(requestId);
-          if (code === 0 || code === 6) resolve();        // 6 = already had text, ok
+          if (code === 0 || code === 6) resolve();
           else if (code === null) reject(Object.assign(new Error('Cancelled'), { killed: true }));
           else reject(new Error(`Page ${i}: ocrmypdf exited with code ${code}`));
         });
@@ -243,7 +407,6 @@ async function ocrByPage(inputPath, outputPath, requestId) {
       ocrPagePaths.push(pageOut);
     }
 
-    // Merge all OCR'd pages into final output
     await execFileAsync('qpdf', ['--empty', '--pages', ...ocrPagePaths, '--', outputPath]);
   } finally {
     try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch {}
@@ -259,17 +422,14 @@ app.post('/api/ocr', async (req, res) => {
   const outputPath = path.join(os.tmpdir(), `box-ocr-out-${file_id}.pdf`);
 
   try {
-    // Download
     const { data } = await axios.get(
       `https://api.box.com/2.0/files/${file_id}/content`,
       { headers: { Authorization: `Bearer ${access_token}` }, responseType: 'arraybuffer' }
     );
     fs.writeFileSync(inputPath, data);
 
-    // OCR page by page
     await ocrByPage(inputPath, outputPath, request_id);
 
-    // Upload new version to Box
     const form = new FormData();
     form.append('attributes', JSON.stringify({ name: file_name }));
     form.append('file', fs.createReadStream(outputPath), {
@@ -316,7 +476,13 @@ function renderApp(fileId, fileName, accessToken) {
   <style>
     * { box-sizing: border-box; margin: 0; padding: 0; }
     body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #f5f5f5; color: #333; padding: 20px; }
-    h1 { font-size: 18px; font-weight: 700; color: #0061d5; margin-bottom: 16px; }
+    h1 { font-size: 18px; font-weight: 700; color: #0061d5; margin-bottom: 4px; }
+    .tabs { display: flex; gap: 0; margin-bottom: 20px; border-bottom: 2px solid #e0e0e0; }
+    .tab { background: none; border: none; padding: 10px 18px; font-size: 14px; font-weight: 500; color: #666; cursor: pointer; border-bottom: 2px solid transparent; margin-bottom: -2px; }
+    .tab.active { color: #0061d5; border-bottom-color: #0061d5; }
+    .tab:hover:not(.active) { color: #333; }
+    .panel { display: none; }
+    .panel.active { display: block; }
     .actions { display: flex; gap: 10px; margin-bottom: 20px; flex-wrap: wrap; }
     button { background: #0061d5; color: #fff; border: none; border-radius: 6px; padding: 10px 18px; font-size: 14px; cursor: pointer; font-weight: 500; }
     button:hover { background: #004fad; }
@@ -326,7 +492,8 @@ function renderApp(fileId, fileName, accessToken) {
     button.secondary:disabled { background: #eee; color: #999; border-color: #ccc; }
     button.danger { background: #c00; }
     button.danger:hover { background: #a00; }
-    #log { background: #fff; border-radius: 8px; box-shadow: 0 1px 3px rgba(0,0,0,0.08); padding: 16px; max-height: 400px; overflow-y: auto; }
+    button.sm { padding: 5px 12px; font-size: 12px; }
+    #log { background: #fff; border-radius: 8px; box-shadow: 0 1px 3px rgba(0,0,0,0.08); padding: 16px; max-height: 360px; overflow-y: auto; }
     .entry { padding: 6px 0; border-bottom: 1px solid #f0f0f0; font-size: 13px; display: flex; align-items: center; gap: 8px; }
     .entry:last-child { border-bottom: none; }
     .entry .name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -339,31 +506,71 @@ function renderApp(fileId, fileName, accessToken) {
     .summary.ok { background: #e8f5e9; color: #2e7d32; }
     .summary.err { background: #fce4ec; color: #c00; }
     .summary.warn { background: #fff8e1; color: #f57c00; }
+    .folder-row { display: flex; align-items: center; gap: 10px; padding: 10px 14px; background: #fff; border-radius: 8px; box-shadow: 0 1px 3px rgba(0,0,0,0.08); margin-bottom: 10px; font-size: 14px; }
+    .folder-row .name { flex: 1; font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .badge { font-size: 11px; font-weight: 600; padding: 3px 8px; border-radius: 10px; }
+    .badge.on { background: #e8f5e9; color: #2e7d32; }
+    .badge.off { background: #f5f5f5; color: #999; }
+    .info { font-size: 13px; color: #666; margin-bottom: 16px; line-height: 1.5; }
+    .section-title { font-size: 13px; font-weight: 600; color: #666; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 10px; }
+    .empty { color: #999; font-size: 13px; font-style: italic; padding: 12px 0; }
   </style>
 </head>
 <body>
   <h1>Box PDF OCR</h1>
-  <div class="actions">
-    <button id="btn-file" onclick="ocrSingleFile()">OCR this file</button>
-    <button id="btn-folder" class="secondary" onclick="ocrFolder()">OCR all PDFs in folder</button>
-    <button id="btn-cancel" class="danger" onclick="cancelOcr()" style="display:none;">Cancel</button>
+
+  <div class="tabs">
+    <button class="tab active" onclick="switchTab('ocr', this)">OCR</button>
+    <button class="tab" onclick="switchTab('auto', this)">Auto-OCR</button>
   </div>
-  <div id="log"></div>
-  <div id="summary"></div>
+
+  <!-- OCR Tab -->
+  <div id="panel-ocr" class="panel active">
+    <div class="actions">
+      <button id="btn-file" onclick="ocrSingleFile()">OCR this file</button>
+      <button id="btn-folder" class="secondary" onclick="ocrFolder()">OCR all PDFs in folder</button>
+      <button id="btn-cancel" class="danger" onclick="cancelOcr()" style="display:none;">Cancel</button>
+    </div>
+    <div id="log"></div>
+    <div id="summary"></div>
+  </div>
+
+  <!-- Auto-OCR Tab -->
+  <div id="panel-auto" class="panel">
+    <p class="info">Auto-OCR watches a folder and automatically makes new PDFs searchable when they are uploaded — no manual steps needed.</p>
+
+    <div class="section-title">This folder</div>
+    <div id="current-folder-row">
+      <div class="folder-row"><span class="name">Loading…</span></div>
+    </div>
+
+    <div class="section-title" style="margin-top:20px;">All watched folders</div>
+    <div id="watched-list"><div class="empty">Loading…</div></div>
+  </div>
+
   <script>
-    const FILE_ID = ${JSON.stringify(fileId)};
+    const FILE_ID   = ${JSON.stringify(fileId)};
     const FILE_NAME = ${JSON.stringify(fileName)};
-    const TOKEN = ${JSON.stringify(accessToken)};
-    const log = document.getElementById('log');
+    const TOKEN     = ${JSON.stringify(accessToken)};
+
+    // ── Tab switching ────────────────────────────────────────────────────────
+    function switchTab(name, btn) {
+      document.querySelectorAll('.panel').forEach(p => p.classList.remove('active'));
+      document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+      document.getElementById('panel-' + name).classList.add('active');
+      btn.classList.add('active');
+      if (name === 'auto' && !autoLoaded) loadAutoOcr();
+    }
+
+    // ── OCR Tab ──────────────────────────────────────────────────────────────
+    const log     = document.getElementById('log');
     const summary = document.getElementById('summary');
     let cancelled = false;
     let currentRequestId = null;
 
-    function showCancel(show) {
-      document.getElementById('btn-cancel').style.display = show ? 'inline-block' : 'none';
-    }
+    function showCancel(show) { document.getElementById('btn-cancel').style.display = show ? 'inline-block' : 'none'; }
     function disable(yes) {
-      document.getElementById('btn-file').disabled = yes;
+      document.getElementById('btn-file').disabled   = yes;
       document.getElementById('btn-folder').disabled = yes;
     }
     function addEntry(id, name) {
@@ -466,6 +673,100 @@ function renderApp(fileId, fileName, accessToken) {
         summary.textContent = 'Error: ' + e.message;
       }
       showCancel(false); disable(false);
+    }
+
+    // ── Auto-OCR Tab ─────────────────────────────────────────────────────────
+    let autoLoaded = false;
+    let currentFolderId   = null;
+    let currentFolderName = null;
+    let watchedFolders    = {};
+
+    async function loadAutoOcr() {
+      autoLoaded = true;
+      try {
+        const [folderRes, watchedRes] = await Promise.all([
+          fetch('/api/folder-pdfs?file_id=' + FILE_ID + '&access_token=' + encodeURIComponent(TOKEN)),
+          fetch('/api/watched-folders')
+        ]);
+        const folderData  = await folderRes.json();
+        watchedFolders    = await watchedRes.json();
+        currentFolderId   = folderData.folder_id;
+        currentFolderName = folderData.folder_name;
+        renderAutoOcr();
+      } catch (e) {
+        document.getElementById('current-folder-row').innerHTML =
+          '<div class="folder-row"><span class="name" style="color:#c00">Error loading folder info: ' + esc(e.message) + '</span></div>';
+      }
+    }
+
+    function renderAutoOcr() {
+      // Current folder row
+      const isWatching = currentFolderId && watchedFolders[currentFolderId];
+      document.getElementById('current-folder-row').innerHTML = currentFolderId ? \`
+        <div class="folder-row">
+          <span class="name">\${esc(currentFolderName || currentFolderId)}</span>
+          <span class="badge \${isWatching ? 'on' : 'off'}">\${isWatching ? 'Watching' : 'Not watching'}</span>
+          \${isWatching
+            ? '<button class="secondary sm" onclick="unwatchFolder(' + JSON.stringify(currentFolderId) + ')">Stop</button>'
+            : '<button class="sm" onclick="watchCurrentFolder()">Watch</button>'
+          }
+        </div>
+      \` : '<div class="folder-row"><span class="name" style="color:#999">Could not determine folder</span></div>';
+
+      // All watched folders
+      const entries = Object.entries(watchedFolders);
+      const listEl  = document.getElementById('watched-list');
+      if (entries.length === 0) {
+        listEl.innerHTML = '<div class="empty">No folders are being watched yet.</div>';
+        return;
+      }
+      listEl.innerHTML = entries.map(([fid, info]) => \`
+        <div class="folder-row">
+          <span class="name">\${esc(info.folderName || fid)}</span>
+          <span class="badge on">Watching</span>
+          <button class="secondary sm" onclick="unwatchFolder(\${JSON.stringify(fid)})">Stop</button>
+        </div>
+      \`).join('');
+    }
+
+    async function watchCurrentFolder() {
+      if (!currentFolderId) return;
+      setFolderRowLoading();
+      try {
+        const res = await fetch('/api/watch-folder', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ folder_id: currentFolderId, folder_name: currentFolderName, access_token: TOKEN })
+        });
+        const data = await res.json();
+        if (data.error) throw new Error(data.error);
+        watchedFolders[currentFolderId] = { webhookId: data.webhookId, folderName: currentFolderName };
+        renderAutoOcr();
+      } catch (e) {
+        document.getElementById('current-folder-row').innerHTML =
+          '<div class="folder-row"><span class="name" style="color:#c00">Error: ' + esc(e.message) + '</span></div>';
+      }
+    }
+
+    async function unwatchFolder(folderId) {
+      try {
+        const res = await fetch('/api/unwatch-folder', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ folder_id: folderId, access_token: TOKEN })
+        });
+        const data = await res.json();
+        if (data.error) throw new Error(data.error);
+        delete watchedFolders[folderId];
+        renderAutoOcr();
+      } catch (e) {
+        alert('Error: ' + e.message);
+      }
+    }
+
+    function setFolderRowLoading() {
+      document.getElementById('current-folder-row').innerHTML =
+        '<div class="folder-row"><div class="spinner"></div><span class="name">Enabling auto-OCR…</span></div>';
     }
 
     function esc(s) { const d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
